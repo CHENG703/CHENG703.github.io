@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STC - 用户注册</title>
+    <script src="js/config.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle at 30% 30%, rgba(102, 126, 234, 0.3) 0%, transparent 50%),
+                        radial-gradient(circle at 70% 70%, rgba(118, 75, 162, 0.3) 0%, transparent 50%);
+            animation: bgMove 20s linear infinite;
+        }
+
+        @keyframes bgMove {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .register-container {
+            position: relative;
+            z-index: 10;
+            width: 100%;
+            max-width: 420px;
+        }
+
+        .glass-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 24px;
+            padding: 40px;
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3),
+                        inset 0 1px 1px rgba(255, 255, 255, 0.1);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .logo-container {
+            width: 70px;
+            height: 70px;
+            margin: 0 auto 20px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border-radius: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+            animation: float 3s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-8px); }
+        }
+
+        .title {
+            font-size: 26px;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 14px;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        .form-input-wrapper {
+            position: relative;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 14px 18px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 12px;
+            color: #fff;
+            font-size: 15px;
+            transition: all 0.3s;
+            outline: none;
+        }
+
+        .form-input:focus {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: #667eea;
+            box-shadow: 0 0 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .form-input::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+
+        .form-input.error {
+            border-color: #ef4444;
+            box-shadow: 0 0 15px rgba(239, 68, 68, 0.2);
+        }
+
+        .input-icon {
+            position: absolute;
+            right: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 16px;
+        }
+
+        .invite-code-wrapper {
+            display: flex;
+            gap: 10px;
+        }
+
+        .invite-code-wrapper .form-input {
+            flex: 1;
+        }
+
+        .invite-code-wrapper .send-btn {
+            padding: 14px 18px;
+            background: rgba(102, 126, 234, 0.3);
+            border: 1px solid rgba(102, 126, 234, 0.5);
+            border-radius: 12px;
+            color: #667eea;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+            white-space: nowrap;
+        }
+
+        .invite-code-wrapper .send-btn:hover {
+            background: rgba(102, 126, 234, 0.5);
+        }
+
+        .invite-code-wrapper .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .register-btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
+        }
+
+        .register-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 40px rgba(102, 126, 234, 0.4);
+        }
+
+        .register-btn:active {
+            transform: translateY(0);
+        }
+
+        .register-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .error-message {
+            background: rgba(239, 68, 68, 0.2);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 10px;
+            padding: 12px 16px;
+            color: #ef4444;
+            font-size: 13px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .error-message.show {
+            display: block;
+            animation: shake 0.5s ease;
+        }
+
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-5px); }
+            75% { transform: translateX(5px); }
+        }
+
+        .success-message {
+            background: rgba(16, 185, 129, 0.2);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 10px;
+            padding: 12px 16px;
+            color: #10b981;
+            font-size: 13px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .success-message.show {
+            display: block;
+        }
+
+        .login-link {
+            text-align: center;
+            margin-top: 24px;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 14px;
+        }
+
+        .login-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+            transition: color 0.3s;
+        }
+
+        .login-link a:hover {
+            color: #764ba2;
+        }
+
+        .no-invite-link {
+            text-align: right;
+            margin-top: 8px;
+        }
+
+        .no-invite-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 13px;
+            transition: color 0.3s;
+        }
+
+        .no-invite-link a:hover {
+            color: #764ba2;
+        }
+
+        .back-link {
+            text-align: center;
+            margin-top: 16px;
+        }
+
+        .back-link a {
+            color: rgba(255, 255, 255, 0.5);
+            text-decoration: none;
+            font-size: 13px;
+            transition: color 0.3s;
+        }
+
+        .back-link a:hover {
+            color: #667eea;
+        }
+
+        @media (max-width: 480px) {
+            .glass-card {
+                padding: 28px 20px;
+            }
+            
+            .title {
+                font-size: 22px;
+            }
+            
+            .invite-code-wrapper {
+                flex-direction: column;
+            }
+            
+            .invite-code-wrapper .send-btn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="register-container">
+        <div class="glass-card">
+            <div class="header">
+                <div class="logo-container">✨</div>
+                <h1 class="title">创建账号</h1>
+                <p class="subtitle">加入 STC 任务平台</p>
+            </div>
+
+            <div id="error-message" class="error-message"></div>
+            <div id="success-message" class="success-message"></div>
+
+            <form id="register-form">
+                <div class="form-group">
+                    <label class="form-label">用户名</label>
+                    <div class="form-input-wrapper">
+                        <input type="text" class="form-input" id="username" name="username" placeholder="3-20位字母或数字" required>
+                        <span class="input-icon">👤</span>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">邮箱</label>
+                    <div class="form-input-wrapper">
+                        <input type="email" class="form-input" id="email" name="email" placeholder="请输入邮箱地址" required>
+                        <span class="input-icon">📧</span>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">密码</label>
+                    <div class="form-input-wrapper">
+                        <input type="password" class="form-input" id="password" name="password" placeholder="至少6位字符" required>
+                        <span class="input-icon">🔒</span>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">确认密码</label>
+                    <div class="form-input-wrapper">
+                        <input type="password" class="form-input" id="confirm-password" name="confirm-password" placeholder="再次输入密码" required>
+                        <span class="input-icon">🔐</span>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">邮箱验证码</label>
+                    <div class="invite-code-wrapper">
+                        <input type="text" class="form-input" id="email-code" name="email-code" placeholder="请输入验证码">
+                        <button type="button" class="send-btn" id="send-code-btn" onclick="sendEmailCode()">发送验证码</button>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">邀请码</label>
+                    <input type="text" class="form-input" id="invite-code" name="invite-code" placeholder="请输入邀请码（选填）">
+                    <div class="no-invite-link">
+                        <a href="/apply-invite">我没有邀请码？申请一个</a>
+                    </div>
+                </div>
+
+                <button type="submit" class="register-btn" id="register-btn">注 册</button>
+            </form>
+
+            <div class="login-link">
+                已有账号？ <a href="/login">立即登录</a>
+            </div>
+
+            <div class="back-link">
+                <a href="/">← 返回首页</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 检查URL参数
+        const urlParams = new URLSearchParams(window.location.search);
+        const error = urlParams.get('error');
+        const message = urlParams.get('message');
+
+        if (error) {
+            const errorEl = document.getElementById('error-message');
+            errorEl.textContent = decodeURIComponent(error);
+            errorEl.classList.add('show');
+        }
+
+        if (message) {
+            const successEl = document.getElementById('success-message');
+            successEl.textContent = decodeURIComponent(message);
+            successEl.classList.add('show');
+            setTimeout(() => {
+                successEl.classList.remove('show');
+            }, 5000);
+        }
+
+        // 发送邮箱验证码
+        let codeTimer = null;
+        function sendEmailCode() {
+            const email = document.getElementById('email').value.trim();
+            const btn = document.getElementById('send-code-btn');
+            
+            if (!email) {
+                showError('请先输入邮箱地址');
+                return;
+            }
+            
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                showError('请输入有效的邮箱地址');
+                return;
+            }
+            
+            btn.disabled = true;
+            btn.textContent = '发送中...';
+            
+            fetch('/api/send-verification', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ email })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showSuccess('验证码已发送到您的邮箱');
+                    let countdown = 60;
+                    btn.textContent = countdown + 's';
+                    codeTimer = setInterval(() => {
+                        countdown--;
+                        if (countdown <= 0) {
+                            clearInterval(codeTimer);
+                            btn.disabled = false;
+                            btn.textContent = '发送验证码';
+                        } else {
+                            btn.textContent = countdown + 's';
+                        }
+                    }, 1000);
+                } else {
+                    showError(data.message || '发送验证码失败');
+                    btn.disabled = false;
+                    btn.textContent = '发送验证码';
+                }
+            })
+            .catch(error => {
+                showError('网络错误，请重试');
+                btn.disabled = false;
+                btn.textContent = '发送验证码';
+            });
+        }
+
+        // 注册表单提交
+        document.getElementById('register-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const username = document.getElementById('username').value.trim();
+            const email = document.getElementById('email').value.trim();
+            const password = document.getElementById('password').value;
+            const confirmPassword = document.getElementById('confirm-password').value;
+            const emailCode = document.getElementById('email-code').value.trim();
+            const inviteCode = document.getElementById('invite-code').value.trim();
+            const btn = document.getElementById('register-btn');
+            
+            // 验证
+            if (!username || !email || !password || !confirmPassword || !emailCode) {
+                showError('请填写所有必填项');
+                return;
+            }
+            
+            if (!/^[a-zA-Z0-9]{3,20}$/.test(username)) {
+                showError('用户名必须是3-20位字母或数字');
+                return;
+            }
+            
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                showError('请输入有效的邮箱地址');
+                return;
+            }
+            
+            if (password.length < 6) {
+                showError('密码至少需要6位字符');
+                return;
+            }
+            
+            if (password !== confirmPassword) {
+                showError('两次输入的密码不一致');
+                return;
+            }
+            
+            btn.disabled = true;
+            btn.textContent = '注册中...';
+            
+            try {
+                const response = await fetch('/api/register', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ username, email, password, emailCode, inviteCode })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showSuccess('注册成功！正在跳转...');
+                    setTimeout(() => {
+                        window.location.href = '/login?message=' + encodeURIComponent('注册成功，请登录');
+                    }, 1000);
+                } else {
+                    showError(data.message || '注册失败');
+                    btn.disabled = false;
+                    btn.textContent = '注 册';
+                }
+            } catch (error) {
+                showError('网络错误，请重试');
+                btn.disabled = false;
+                btn.textContent = '注 册';
+            }
+        });
+
+        function showError(msg) {
+            const el = document.getElementById('error-message');
+            el.textContent = msg;
+            el.classList.add('show');
+            setTimeout(() => el.classList.remove('show'), 5000);
+        }
+
+        function showSuccess(msg) {
+            const el = document.getElementById('success-message');
+            el.textContent = msg;
+            el.classList.add('show');
+        }
+    </script>
+    
+    <!-- 版权水印 -->
+    <div class="copyright-watermark">© 2025-2026 STC 版权所有</div>
+</body>
+</html>
