@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <script src="/js/device-id.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>STC任务网站 - 欢迎访问</title>
@@ -10,11 +11,63 @@
     <meta name="spider" content="noindex, nofollow">
     <meta name="bot" content="noindex, nofollow">
     <meta name="crawler" content="noindex, nofollow">
-    <link rel="stylesheet" href="css/style.css">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <link rel="stylesheet" href="css/style-v5.css?v=19">
     <script src="js/lang.js"></script>
     <script src="js/config.js"></script>
+    <script src="js/bj-time.js?v=16"></script>
+    <style>
+        /* 首页公告区 */
+        .announcements-section {
+            padding: 26px 0 6px;
+        }
+        .announcements-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 18px;
+        }
+        .announcement-card {
+            background: var(--card-bg, rgba(255, 255, 255, 0.06));
+            border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+            border-radius: 12px;
+            padding: 14px 16px;
+        }
+        .announcement-card .announcement-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 6px;
+        }
+        .announcement-card .announcement-title {
+            font-weight: 600;
+            color: var(--text-primary, #f1f5f9);
+            font-size: 15px;
+        }
+        .announcement-card .announcement-meta {
+            font-size: 12px;
+            color: var(--text-secondary, #94a3b8);
+            white-space: nowrap;
+        }
+        .announcement-card .announcement-content {
+            color: var(--text-secondary, #cbd5e1);
+            font-size: 14px;
+            line-height: 1.7;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+    </style>
 </head>
-<body>
+<body class="bg-image">
+    <div class="page-bg" aria-hidden="true"></div>
+    <div class="aurora-bg">
+        <div class="aurora-blob aurora-blob-1"></div>
+        <div class="aurora-blob aurora-blob-2"></div>
+    </div>
     <nav class="navbar">
         <div class="container">
             <div class="nav-brand">
@@ -23,6 +76,7 @@
             <ul class="nav-menu" id="navMenu">
                 <li><a href="/home" class="active" data-lang="nav.home">首页</a></li>
                 <li><a href="/about" data-lang="nav.about">关于我们</a></li>
+                <li><a href="/products" data-lang="nav.products">产品</a></li>
                 <li><a href="#tasks" data-lang="nav.tasks">任务</a></li>
                 <li><a href="/reaction">测试</a></li>
                 <li><a href="#messages" data-lang="nav.messages">留言</a></li>
@@ -37,24 +91,32 @@
             <div class="container">
                 <h1 data-lang="home.title">欢迎来到STC任务网站</h1>
                 <p data-lang="home.subtitle">一个现代化的社区平台，分享你的想法</p>
-                <div class="hero-stats">
-                    <div class="stat-item">
-                        <span class="stat-value" id="union-days">0</span>
-                        <span class="stat-label" data-lang="home.days">天</span>
-                    </div>
+                <div class="hero-quote">
+                    <p class="quote-text" id="quote-text"></p>
+                    <p class="quote-source" id="quote-source"></p>
                 </div>
                 <div class="hero-buttons" id="hero-buttons">
                     <a href="/register" class="btn btn-primary">立即注册</a>
                     <a href="/login" class="btn btn-secondary" data-lang="nav.login">登录</a>
+                    <a href="/join.html" class="btn btn-secondary">加入我们</a>
+                </div>
+            </div>
+        </section>
+
+        <section id="announcements" class="announcements-section">
+            <div class="container">
+                <h2 class="section-title">📢 平台公告</h2>
+                <div id="announcements-list" class="announcements-list">
+                    <div class="loading">加载中...</div>
                 </div>
             </div>
         </section>
 
         <section id="tasks" class="tasks-section">
             <div class="container">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                    <h2 class="section-title" data-lang="home.tasksTitle" style="margin-bottom:0;">最近任务</h2>
-                    <button id="btn-publish-task" onclick="publishTask()" style="background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:white; border:none; padding:10px 20px; border-radius:8px; font-size:14px; cursor:pointer; font-weight:600; box-shadow:0 2px 10px rgba(102,126,234,0.3); transition: transform 0.2s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
+                <div class="tasks-header">
+                    <h2 class="section-title" data-lang="home.tasksTitle">最近任务</h2>
+                    <button id="btn-publish-task" onclick="publishTask()" class="btn btn-primary btn-sm">
                         ➕ 发布任务
                     </button>
                 </div>
@@ -105,14 +167,15 @@
                 <a href="#" onclick="showTerms('service')">使用条款</a> | 
                 <a href="#" onclick="showTerms('privacy')">隐私协议</a>
             </p>
-            <p class="footer-note">一切解释权归STC团队</p>
+            <p class="footer-note">使用本网站即表示您已阅读并同意服务条款与隐私协议</p>
         </div>
     </footer>
 
     <!-- 版权水印 -->
     <div class="copyright-watermark">© 2025-2026 STC 版权所有</div>
 
-    <script src="js/main.js"></script>
+    <script src="js/main.js?v=20"></script>
+    <script src="js/animations.js"></script>
     <script>
         function showTerms(type) {
             window.open('/terms.html?type=' + type, 'terms', 'width=800,height=600,scrollbars=yes,resizable=yes');

@@ -9,6 +9,7 @@ const LANGUAGES = {
                 brand: 'STC工会任务平台',
                 home: '首页',
                 about: '关于我们',
+                products: '产品',
                 tasks: '任务',
                 messages: '留言',
                 login: '登录',
@@ -77,6 +78,7 @@ const LANGUAGES = {
             // 登录页
             login: {
                 title: '登录',
+                subtitle: '登录到 STC 任务平台',
                 passwordLogin: '密码登录',
                 codeLogin: '验证码登录',
                 username: '用户名/邮箱',
@@ -207,6 +209,7 @@ const LANGUAGES = {
             },
             login: {
                 title: '登入',
+                subtitle: '登入 STC 任務平台',
                 passwordLogin: '密碼登入',
                 codeLogin: '驗證碼登入',
                 username: '用戶名/郵箱',
@@ -269,6 +272,7 @@ const LANGUAGES = {
                 brand: 'STC Union Task Platform',
                 home: 'Home',
                 about: 'About Us',
+                products: 'Products',
                 tasks: 'Tasks',
                 messages: 'Messages',
                 login: 'Login',
@@ -334,6 +338,7 @@ const LANGUAGES = {
             },
             login: {
                 title: 'Login',
+                subtitle: 'Sign in to STC Task Platform',
                 passwordLogin: 'Password Login',
                 codeLogin: 'Code Login',
                 username: 'Username/Email',
@@ -396,6 +401,7 @@ const LANGUAGES = {
                 brand: 'Платформа задач STC',
                 home: 'Главная',
                 about: 'О нас',
+                products: 'Продукты',
                 tasks: 'Задачи',
                 messages: 'Сообщения',
                 login: 'Войти',
@@ -461,6 +467,7 @@ const LANGUAGES = {
             },
             login: {
                 title: 'Вход',
+                subtitle: 'Вход в STC Task Platform',
                 passwordLogin: 'По паролю',
                 codeLogin: 'По коду',
                 username: 'Имя/Email',
@@ -523,6 +530,7 @@ const LANGUAGES = {
                 brand: 'Plateforme de tâches STC',
                 home: 'Accueil',
                 about: 'À propos',
+                products: 'Produits',
                 tasks: 'Tâches',
                 messages: 'Messages',
                 login: 'Connexion',
@@ -588,6 +596,7 @@ const LANGUAGES = {
             },
             login: {
                 title: 'Connexion',
+                subtitle: 'Connexion à STC Task Platform',
                 passwordLogin: 'Par mot de passe',
                 codeLogin: 'Par code',
                 username: 'Nom/Email',
@@ -715,6 +724,7 @@ const LANGUAGES = {
             },
             login: {
                 title: 'Anmelden',
+                subtitle: 'Anmeldung bei STC Task Platform',
                 passwordLogin: 'Passwort-Anmeldung',
                 codeLogin: 'Code-Anmeldung',
                 username: 'Benutzername/Email',
@@ -852,13 +862,16 @@ const LangManager = {
         if (navMenu) {
             const items = navMenu.querySelectorAll('li a');
             items.forEach(item => {
-                if (item.getAttribute('href') === '/home' || item.classList.contains('active')) {
+                if (item.getAttribute('href') === '/home' || (item.classList.contains('active') && item.hasAttribute('data-lang'))) {
                     if (!item.closest('#nav-user')) {
                         item.textContent = this.getTranslation('nav.home');
                     }
                 }
                 if (item.getAttribute('href') === '/about') {
                     item.textContent = this.getTranslation('nav.about');
+                }
+                if (item.getAttribute('href') === '/products') {
+                    item.textContent = this.getTranslation('nav.products');
                 }
                 if (item.getAttribute('href') === '#tasks') {
                     item.textContent = this.getTranslation('nav.tasks');

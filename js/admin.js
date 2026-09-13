@@ -1,14 +1,234 @@
+const LogStreamManager = {
+    lastLogId: null,
+    status: 'disconnected',
+    subscribers: [],
+    statusSubscribers: [],
+    reader: null,
+    controller: null,
+    reconnectAttempts: 0,
+    maxReconnectAttempts: Infinity,
+
+    subscribe(callback) {
+        this.subscribers.push(callback);
+        return () => {
+            const idx = this.subscribers.indexOf(callback);
+            if (idx !== -1) {
+                this.subscribers.splice(idx, 1);
+            }
+        };
+    },
+
+    onStatusChange(callback) {
+        this.statusSubscribers.push(callback);
+        return () => {
+            const idx = this.statusSubscribers.indexOf(callback);
+            if (idx !== -1) {
+                this.statusSubscribers.splice(idx, 1);
+            }
+        };
+    },
+
+    subscribeStatus(callback) {
+        this.statusSubscribers.push(callback);
+        return () => {
+            const idx = this.statusSubscribers.indexOf(callback);
+            if (idx !== -1) {
+                this.statusSubscribers.splice(idx, 1);
+            }
+        };
+    },
+
+    start() {
+        if (this.status === 'connecting' || this.status === 'connected' || this.status === 'reconnecting') {
+            return;
+        }
+        this.reconnectAttempts = 0;
+        this._connect();
+    },
+
+    stop() {
+        if (this.controller) {
+            this.controller.abort();
+            this.controller = null;
+        }
+        if (this.reader) {
+            try { this.reader.cancel(); } catch(e) {}
+            this.reader = null;
+        }
+        this._setStatus('disconnected');
+    },
+
+    async _connect(silent) {
+        if (this.status === 'connecting') return;
+
+        // silent 模式（收到服务端 reconnect 事件时）：保持 connected 状态静默重连
+        if (!silent) {
+            this._setStatus(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting');
+        }
+
+        try {
+            await this._fetchMissingLogs();
+        } catch (e) {
+            console.error('获取增量日志失败:', e);
+        }
+
+        try {
+            this.controller = new AbortController();
+            const response = await fetchWithAuth('/api/logs/sse', {
+                signal: this.controller.signal,
+                headers: { 'Accept': 'text/event-stream' }
+            });
+
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+
+            this._setStatus('connected');
+            this.reconnectAttempts = 0;
+
+            this.reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await this.reader.read();
+
+                if (done) {
+                    break;
+                }
+
+                buffer += decoder.decode(value, { stream: true });
+                const events = buffer.split('\n\n');
+                buffer = events.pop() || '';
+
+                for (const event of events) {
+                    const trimmed = event.trim();
+                    if (!trimmed) continue;
+
+                    const dataMatch = trimmed.match(/^data: (.+)$/m);
+                    if (dataMatch) {
+                        try {
+                            const entry = JSON.parse(dataMatch[1]);
+                            if (entry.type === 'reconnect') {
+                                if (this.reader) {
+                                    try { this.reader.cancel(); } catch(e) {}
+                                    this.reader = null;
+                                }
+                                this._connect(true); // 静默重连，不闪烁状态
+                                return;
+                            }
+                            if (entry.id) {
+                                this.lastLogId = entry.id;
+                            }
+                            this._notify(entry);
+                        } catch (e) {}
+                    }
+                }
+            }
+
+            this._handleDisconnect();
+        } catch (e) {
+            if (e.name === 'AbortError') {
+                this._setStatus('disconnected');
+                return;
+            }
+            this._handleDisconnect(e);
+        }
+    },
+
+    _handleDisconnect(error) {
+        this.reader = null;
+        this.controller = null;
+
+        // 无限重连（Vercel Serverless 下 SSE 周期断开是常态，不能重连几次就停）
+        this.reconnectAttempts++;
+        this._setStatus('reconnecting');
+
+        // 指数退避：1s, 2s, 4s, 8s, 10s(上限)，连接成功后会重置 reconnectAttempts
+        const delay = Math.min(1000 * Math.pow(2, Math.min(this.reconnectAttempts - 1, 4)), 10000);
+        setTimeout(() => {
+            this._connect();
+        }, delay);
+    },
+
+    async _fetchMissingLogs() {
+        const url = this.lastLogId
+            ? '/api/logs?since=' + encodeURIComponent(this.lastLogId)
+            : '/api/logs';
+
+        const response = await fetchWithAuth(url);
+        const data = await response.json();
+
+        if (data.success && data.data && data.data.length > 0) {
+            for (const entry of data.data) {
+                if (entry.id) {
+                    this.lastLogId = entry.id;
+                }
+                this._notify(entry);
+            }
+        }
+    },
+
+    _notify(entry) {
+        for (const cb of this.subscribers) {
+            try {
+                cb(entry);
+            } catch (e) {
+                console.error('Log subscriber error:', e);
+            }
+        }
+    },
+
+    _setStatus(status) {
+        this.status = status;
+        for (const cb of this.statusSubscribers) {
+            try {
+                cb(status);
+            } catch (e) {
+                console.error('Status subscriber error:', e);
+            }
+        }
+    }
+};
+
 // CMD日志系统
 const CMDLog = {
     logs: [],
     maxLogs: 100,
     terminalId: 'cmd-terminal-overlay',
-    logStream: null,
 
     init() {
         this.injectStyles();
         this.createTerminal();
-        this.connectToServerLogs();
+        LogStreamManager.subscribe(entry => {
+            this.log(entry.message, entry.type);
+        });
+        LogStreamManager.onStatusChange(status => {
+            const statusMap = {
+                connecting: { text: '日志流连接中...', type: 'warn' },
+                connected: { text: '日志流已连接', type: 'success' },
+                reconnecting: { text: '日志流重连中...', type: 'warn' },
+                disconnected: { text: '日志流已断开', type: 'error' }
+            };
+            const info = statusMap[status];
+            if (info) {
+                this.log(info.text, info.type);
+            }
+
+            const titleStatusMap = {
+                connecting: { text: '连接中...', color: '#f59e0b' },
+                connected: { text: '已连接', color: '#10b981' },
+                reconnecting: { text: '重连中...', color: '#f97316' },
+                disconnected: { text: '已断开', color: '#ef4444' }
+            };
+            const titleInfo = titleStatusMap[status] || { text: '未连接', color: '#888' };
+            const statusEl = document.getElementById('cmd-log-status');
+            if (statusEl) {
+                statusEl.textContent = '(' + titleInfo.text + ')';
+                statusEl.style.color = titleInfo.color;
+            }
+        });
+        LogStreamManager.start();
         this.log('CMD日志系统已初始化', 'system');
     },
 
@@ -98,6 +318,7 @@ const CMDLog = {
             .cmd-log-entry.info { color: #00ff00; }
             .cmd-log-entry.warn { color: #ffff00; }
             .cmd-log-entry.error { color: #ff0000; }
+            .cmd-log-entry.success { color: #10b981; }
             .cmd-log-entry.system { color: #00ffff; }
             .cmd-log-entry.cmd { color: #ff00ff; }
             .cmd-terminal-input-area {
@@ -134,7 +355,7 @@ const CMDLog = {
         terminal.id = this.terminalId;
         terminal.innerHTML = `
             <div class="cmd-terminal-header" onclick="CMDLog.toggleFullscreen()">
-                <span class="cmd-terminal-title">CMD - 服务器日志 <span style="font-size:10px;color:#888">(点击标题栏全屏)</span></span>
+                <span class="cmd-terminal-title">CMD - 服务器日志 <span id="cmd-log-status" style="font-size:10px;color:#888">(未连接)</span></span>
                 <div class="cmd-terminal-controls" onclick="event.stopPropagation()">
                     <button class="cmd-terminal-btn cmd-terminal-btn-fullscreen" onclick="CMDLog.toggleFullscreen()">全屏</button>
                     <button class="cmd-terminal-btn cmd-terminal-btn-clear" onclick="CMDLog.clear()">清除</button>
@@ -191,6 +412,9 @@ const CMDLog = {
                 this.log('users        - 用户数量', 'system');
                 this.log('whoami       - 当前用户', 'system');
                 this.log('date         - 当前时间', 'system');
+                this.log('db           - 数据库持久化状态（排查"改了又变回来"）', 'system');
+                this.log('deltask      - 删除任务自检 (deltask <任务ID>，走与页面相同的鉴权链路)', 'system');
+                this.log('delannounce  - 删除公告自检 (delannounce <公告ID>，走与页面相同的鉴权链路)', 'system');
                 this.log('userinfo     - 查看用户信息 (userinfo <用户名或ID>)', 'system');
                 this.log('createuser   - 创建用户 (createuser <用户名> <邮箱> <密码> [admin])', 'system');
                 this.log('deleteuser   - 删除用户 (deleteuser <用户名或ID>)', 'system');
@@ -233,7 +457,7 @@ const CMDLog = {
                 }
                 if (confirm('确定要停止服务器吗？这将使网站离线！')) {
                     this.log('正在停止服务器...', 'warn');
-                    fetch('/api/console/stop', {method:'POST'}).then(r=>r.json()).then(d=>this.log(d.message, d.success?'info':'error')).catch(e=>this.log('停止失败: '+e.message,'error'));
+                    fetchWithAuth('/api/console/stop', {method:'POST'}).then(r=>r.json()).then(d=>this.log(d.message, d.success?'info':'error')).catch(e=>this.log('停止失败: '+e.message,'error'));
                 } else {
                     this.log('已取消', 'system');
                 }
@@ -249,7 +473,7 @@ const CMDLog = {
                     return;
                 }
                 this.log('正在重启服务器...', 'warn');
-                fetch('/api/console/restart', {method:'POST'}).then(r=>r.json()).then(d=>this.log(d.message, d.success?'info':'error')).catch(e=>this.log('重启失败: '+e.message,'error'));
+                fetchWithAuth('/api/console/restart', {method:'POST'}).then(r=>r.json()).then(d=>this.log(d.message, d.success?'info':'error')).catch(e=>this.log('重启失败: '+e.message,'error'));
                 break;
             case 'status':
                 this.log('服务器状态: 运行中', 'info');
@@ -261,25 +485,145 @@ const CMDLog = {
                 this.log('当前用户: '+(sessionStorage.getItem('username')||'未登录'), 'info');
                 break;
             case 'date':
-                this.log('时间: '+new Date().toLocaleString(), 'info');
+                this.log('时间: '+STCBeijing.datetimeStr(), 'info');
                 break;
+            case 'db':
+                this.log('正在查询数据库持久化状态...', 'warn');
+                fetchWithAuth('/api/admin/db-status', {method:'GET'}).then(r=>r.json()).then(d=>{
+                    if (!d.success) { this.log('查询失败: '+(d.message||'未知错误'), 'error'); return; }
+                    const s = d.data || {};
+                    this.log('存储模式: ' + (s.mode === 'kv' ? 'Vercel KV（云端）' : '本地文件'), 'info');
+                    this.log('KV 启用: ' + (s.kvEnabled ? '是' : '否') + ' / 已加载: ' + (s.kvLoaded ? '是' : '否'), 'info');
+                    if (s.kvDecryptFailed) this.log('⚠ KV 数据解密失败（DB_KEY 与云端密文不匹配），已停止写入 KV！', 'error');
+                    this.log('最近一次 KV 写入成功: ' + (s.kvLastSaveOkAt ? STCBeijing.datetimeStr(s.kvLastSaveOkAt) : '从未成功'), 'info');
+                    if (s.kvLastWriteError) this.log('⚠ 最近 KV 写入错误: ' + s.kvLastWriteError, 'error');
+                    if (s.kvPendingDirtyKeys && s.kvPendingDirtyKeys.length) this.log('待同步集合: ' + s.kvPendingDirtyKeys.join(', '), 'warn');
+                    this.log('本地文件: ' + s.localFile, 'info');
+                    if (s.localLoadFailed) this.log('⚠ 本地数据库解密失败（db.key/DB_KEY 不匹配），已禁止写入！', 'error');
+                    if (s.localWriteError) this.log('⚠ 本地文件写入错误: ' + s.localWriteError, 'error');
+                    this.log('数据体积: ' + (s.persistedSizeBytes >= 0 ? (s.persistedSizeBytes/1024).toFixed(1) + ' KB' : '未知'), 'info');
+                    this.log('集合条数: ' + Object.keys(s.counts||{}).map(k=>k+'='+s.counts[k]).join('   '), 'info');
+                }).catch(e=>this.log('查询失败: '+String(e.message||e),'error'));
+                break;
+            case 'deltask': {
+                // 删除任务自检：完全复刻页面上删除按钮的鉴权链路（CSRF + nonce + Bearer），
+                // 并把每一步的 HTTP 状态与任务数量打印出来，用于区分"没删掉"与"读到了旧缓存"。
+                const delId = parseInt(args, 10);
+                if (!delId) { this.log('用法: deltask <任务ID>（任务ID见首页/任务列表）', 'error'); break; }
+                if (!confirm('将删除任务 #' + delId + '，确定继续？')) { this.log('已取消', 'system'); break; }
+                (async () => {
+                    const listOnce = async (tag) => {
+                        const r = await fetch('/api/tasks?_t=' + Date.now(), { cache: 'no-store', credentials: 'include' });
+                        const j = await r.json().catch(() => ({}));
+                        const arr = j.data || [];
+                        const hit = arr.some(t => t.id === delId);
+                        this.log(tag + '列表: 共 ' + arr.length + ' 条，含 #' + delId + ' = ' + (hit ? '是' : '否') + ' (HTTP ' + r.status + ')', 'info');
+                        return { n: arr.length, hit };
+                    };
+                    try {
+                        this.log('① 删除前读取任务列表...', 'warn');
+                        const b = await listOnce('删除前');
+                        if (!b.hit) this.log('⚠ 删除前列表中就没有该任务，请确认 ID 是否正确', 'warn');
+                        this.log('② 发送 DELETE /api/tasks/' + delId + ' ...', 'warn');
+                        let status = 0, body = '';
+                        try {
+                            const resp = await fetchWithAuth('/api/tasks/' + delId, { method: 'DELETE' });
+                            status = resp.status;
+                            body = await resp.text();
+                        } catch (e) {
+                            if (e.message === 'PermissionDenied') this.log('✗ 请求被拒绝 403：CSRF/nonce 失效或权限不足（页面上的删除也会同样失败）', 'error');
+                            else if (e.message === 'Unauthorized') this.log('✗ 请求被拒绝 401：登录状态已失效，请重新登录', 'error');
+                            else this.log('✗ 请求异常: ' + e.message, 'error');
+                        }
+                        if (status) this.log('   HTTP ' + status + ' ' + String(body).slice(0, 300), status < 400 ? 'info' : 'error');
+                        this.log('③ 删除后重新读取任务列表...', 'warn');
+                        const a = await listOnce('删除后');
+                        if (b.hit && !a.hit) this.log('✓ 删除已生效（服务端与列表都不含该任务）', 'info');
+                        else if (b.hit && a.hit) this.log('✗ 删除未生效：任务仍在（看第②步 HTTP 状态）', 'error');
+                        this.log('④ 查询持久化状态...', 'warn');
+                        const ds = await fetchWithAuth('/api/admin/db-status', { method: 'GET' }).then(r => r.json()).catch(() => null);
+                        if (ds && ds.success) {
+                            const s = ds.data || {};
+                            this.log('   最近 KV 写入成功: ' + (s.kvLastSaveOkAt ? STCBeijing.datetimeStr(s.kvLastSaveOkAt) : '从未成功')
+                                + (s.kvLastWriteError ? '  ⚠ 错误: ' + s.kvLastWriteError : ''), s.kvLastWriteError ? 'error' : 'info');
+                            this.log('   服务端 tasks 条数: ' + ((s.counts || {}).tasks), 'info');
+                        } else {
+                            this.log('   持久化状态查询失败: ' + ((ds && ds.message) || '未知错误'), 'error');
+                        }
+                    } catch (e) {
+                        this.log('自检异常: ' + String(e.message || e), 'error');
+                    }
+                })();
+                break;
+            }
+            case 'delannounce': {
+                // 删除公告自检：与页面上删除按钮完全相同的鉴权链路（CSRF + nonce + Bearer），
+                // 逐步打印 HTTP 状态与公告条数，用于区分"请求被挡住"与"删除没落库"。
+                const annId = String(args || '').trim();
+                if (!annId) { this.log('用法: delannounce <公告ID>（公告ID见公告管理表格的 ID 列）', 'error'); break; }
+                if (!confirm('将删除公告 #' + annId + '，确定继续？')) { this.log('已取消', 'system'); break; }
+                (async () => {
+                    const annListOnce = async (tag) => {
+                        const r = await fetch('/api/announcements?_t=' + Date.now(), { cache: 'no-store', credentials: 'include' });
+                        const j = await r.json().catch(() => ({}));
+                        const arr = j.data || [];
+                        const hit = arr.some(a => String(a && a.id) === annId);
+                        this.log(tag + '公告列表: 共 ' + arr.length + ' 条，含 #' + annId + ' = ' + (hit ? '是' : '否') + ' (HTTP ' + r.status + ')', 'info');
+                        return { n: arr.length, hit };
+                    };
+                    try {
+                        this.log('① 删除前读取公告列表...', 'warn');
+                        const b = await annListOnce('删除前');
+                        if (!b.hit) this.log('⚠ 删除前列表中就没有这条公告，请核对 ID 是否正确', 'warn');
+                        this.log('② 发送 DELETE /api/announcements/' + annId + ' ...', 'warn');
+                        let status = 0, body = '';
+                        try {
+                            const resp = await fetchWithAuth('/api/announcements/' + encodeURIComponent(annId), { method: 'DELETE' });
+                            status = resp.status;
+                            body = await resp.text();
+                        } catch (e) {
+                            if (e.message === 'PermissionDenied') this.log('✗ 请求被拒绝 403：CSRF/nonce 失效或权限不足（页面上的删除也会同样失败）', 'error');
+                            else if (e.message === 'Unauthorized') this.log('✗ 请求被拒绝 401：登录状态已失效，请重新登录', 'error');
+                            else this.log('✗ 请求异常: ' + e.message, 'error');
+                        }
+                        if (status) this.log('   HTTP ' + status + ' ' + String(body).slice(0, 300), status < 400 ? 'info' : 'error');
+                        this.log('③ 删除后重新读取公告列表...', 'warn');
+                        const a2 = await annListOnce('删除后');
+                        if (b.hit && !a2.hit) this.log('✓ 删除已生效（服务端与列表都不含该公告）', 'info');
+                        else if (b.hit && a2.hit) this.log('✗ 删除未生效：公告仍在（看第②步 HTTP 状态）', 'error');
+                        this.log('④ 查询持久化状态...', 'warn');
+                        const ds2 = await fetchWithAuth('/api/admin/db-status', { method: 'GET' }).then(r => r.json()).catch(() => null);
+                        if (ds2 && ds2.success) {
+                            const s2 = ds2.data || {};
+                            this.log('   最近 KV 写入成功: ' + (s2.kvLastSaveOkAt ? STCBeijing.datetimeStr(s2.kvLastSaveOkAt) : '从未成功')
+                                + (s2.kvLastWriteError ? '  ⚠ 错误: ' + s2.kvLastWriteError : ''), s2.kvLastWriteError ? 'error' : 'info');
+                            this.log('   服务端 announcements 条数: ' + ((s2.counts || {}).announcements), 'info');
+                        } else {
+                            this.log('   持久化状态查询失败: ' + ((ds2 && ds2.message) || '未知错误'), 'error');
+                        }
+                    } catch (e) {
+                        this.log('自检异常: ' + String(e.message || e), 'error');
+                    }
+                })();
+                break;
+            }
             case 'banip':
                 if (!args) {
                     this.log('用法: banip <IP地址>', 'error');
                     return;
                 }
                 this.log('正在封禁IP: '+args, 'warn');
-                fetch('/api/admin/banip', {
+                fetchWithAuth('/api/ban-ip', {
                     method: 'POST',
                     headers: {'Content-Type':'application/json'},
-                    body: JSON.stringify({ip: args})
+                    body: JSON.stringify({ip: args, reason: '控制台命令'})
                 }).then(r=>r.json()).then(d=>{
                     if(d.success) {
-                        this.log('IP '+args+' 已封禁', 'info');
+                        this.log('IP '+args+' 已封禁'+(d.linkedDevice?'，并连带封禁其设备':'')+'。', 'info');
                     } else {
                         this.log('封禁失败: '+d.message, 'error');
                     }
-                }).catch(e=>this.log('封禁失败: '+e.message,'error'));
+                }).catch(e=>this.log('封禁失败: '+String(e.message||e).replace('PermissionDenied','无权限（仅超级管理员）'),'error'));
                 break;
             case 'unbanip':
                 if (!args) {
@@ -287,7 +631,7 @@ const CMDLog = {
                     return;
                 }
                 this.log('正在解封IP: '+args, 'warn');
-                fetch('/api/unban-ip', {
+                fetchWithAuth('/api/unban-ip', {
                     method: 'POST',
                     headers: {'Content-Type':'application/json'},
                     body: JSON.stringify({ip: args})
@@ -332,7 +676,7 @@ const CMDLog = {
                     if(d.success) {
                         if(d.lastBackup) {
                             this.log('=== 上次备份信息 ===', 'system');
-                            this.log('备份时间: ' + new Date(d.lastBackup.time).toLocaleString(), 'info');
+                            this.log('备份时间: ' + STCBeijing.datetimeStr(d.lastBackup.time), 'info');
                             this.log('备份名称: ' + d.lastBackup.info.name, 'system');
                             this.log('===================', 'system');
                         } else {
@@ -393,7 +737,7 @@ const CMDLog = {
                                 const size = b.size > 1024*1024*1024 ? (b.size/1024/1024/1024).toFixed(2)+' GB' : 
                                             b.size > 1024*1024 ? (b.size/1024/1024).toFixed(2)+' MB' : 
                                             (b.size/1024).toFixed(2)+' KB';
-                                this.log((i+1) + '. ' + b.name + ' (' + size + ') - ' + new Date(b.created).toLocaleString(), 'info');
+                                this.log((i+1) + '. ' + b.name + ' (' + size + ') - ' + STCBeijing.datetimeStr(b.created), 'info');
                             });
                             this.log('================', 'system');
                         }
@@ -415,7 +759,7 @@ const CMDLog = {
                             const size = b.size > 1024*1024*1024 ? (b.size/1024/1024/1024).toFixed(2)+' GB' : 
                                         b.size > 1024*1024 ? (b.size/1024/1024).toFixed(2)+' MB' : 
                                         (b.size/1024).toFixed(2)+' KB';
-                            this.log((i+1) + '. ' + b.name + ' (' + size + ') - ' + new Date(b.created).toLocaleString(), 'info');
+                            this.log((i+1) + '. ' + b.name + ' (' + size + ') - ' + STCBeijing.datetimeStr(b.created), 'info');
                         });
                         this.log('================', 'system');
                         
@@ -475,7 +819,7 @@ const CMDLog = {
                             const size = b.size > 1024*1024*1024 ? (b.size/1024/1024/1024).toFixed(2)+' GB' : 
                                         b.size > 1024*1024 ? (b.size/1024/1024).toFixed(2)+' MB' : 
                                         (b.size/1024).toFixed(2)+' KB';
-                            this.log((i+1) + '. ' + b.name + ' (' + size + ') - ' + new Date(b.created).toLocaleString(), 'info');
+                            this.log((i+1) + '. ' + b.name + ' (' + size + ') - ' + STCBeijing.datetimeStr(b.created), 'info');
                         });
                         this.log('================', 'system');
                         
@@ -525,7 +869,7 @@ const CMDLog = {
                 }).then(r=>r.json()).then(d=>{
                     if(d.success) {
                         this.log('数据库已锁定！', 'error');
-                        this.log('锁定时间: ' + new Date(d.lockInfo.time).toLocaleString(), 'system');
+                        this.log('锁定时间: ' + STCBeijing.datetimeStr(d.lockInfo.time), 'system');
                     } else {
                         this.log('锁定失败: ' + d.message, 'error');
                     }
@@ -539,7 +883,7 @@ const CMDLog = {
                         this.log('状态: ' + (s.locked ? '已锁定' : '正常'), s.locked ? 'error' : 'info');
                         if(s.locked) {
                             this.log('锁定原因: ' + s.lockReason, 'warn');
-                            this.log('锁定时间: ' + new Date(s.lockTime).toLocaleString(), 'system');
+                            this.log('锁定时间: ' + STCBeijing.datetimeStr(s.lockTime), 'system');
                         }
                         this.log('数据大小: ' + Math.round(s.dataSize / 1024) + ' KB', 'info');
                         this.log('用户数: ' + s.usersCount, 'info');
@@ -609,7 +953,7 @@ const CMDLog = {
                         if (d.locked) {
                             this.log('锁定者: ' + d.lockBy, 'warn');
                             this.log('锁定原因: ' + d.lockReason, 'warn');
-                            this.log('锁定时间: ' + new Date(d.lockTime).toLocaleString(), 'warn');
+                            this.log('锁定时间: ' + STCBeijing.datetimeStr(d.lockTime), 'warn');
                         }
                     } else {
                         this.log('获取状态失败: ' + d.message, 'error');
@@ -688,7 +1032,7 @@ const CMDLog = {
                         this.log('无法封禁超级管理员', 'error');
                         return;
                     }
-                    fetch('/api/members/' + target.id + '/ban', {
+                    fetchWithAuth('/api/members/' + target.id + '/ban', {
                         method: 'POST',
                         headers: {'Content-Type':'application/json'},
                         body: JSON.stringify({ban: true})
@@ -715,7 +1059,7 @@ const CMDLog = {
                         this.log('未找到用户: ' + args, 'error');
                         return;
                     }
-                    fetch('/api/members/' + target.id + '/unban', {
+                    fetchWithAuth('/api/members/' + target.id + '/unban', {
                         method: 'POST',
                         headers: {'Content-Type':'application/json'}
                     }).then(r=>r.json()).then(d=>{
@@ -741,7 +1085,7 @@ const CMDLog = {
                         this.log('未找到用户: ' + args, 'error');
                         return;
                     }
-                    fetch('/api/members/' + target.id + '/set_admin', {
+                    fetchWithAuth('/api/members/' + target.id + '/set_admin', {
                         method: 'POST',
                         headers: {'Content-Type':'application/json'}
                     }).then(r=>r.json()).then(d=>{
@@ -771,7 +1115,7 @@ const CMDLog = {
                         this.log('无法取消超级管理员权限', 'error');
                         return;
                     }
-                    fetch('/api/members/' + target.id + '/unset_admin', {
+                    fetchWithAuth('/api/members/' + target.id + '/unset_admin', {
                         method: 'POST',
                         headers: {'Content-Type':'application/json'}
                     }).then(r=>r.json()).then(d=>{
@@ -803,7 +1147,7 @@ const CMDLog = {
                     this.log('管理员: ' + (target.is_admin ? '是' : '否'), target.is_admin ? 'warn' : 'info');
                     this.log('超级管理员: ' + (target.is_super_admin ? '是' : '否'), target.is_super_admin ? 'warn' : 'info');
                     this.log('封禁状态: ' + (target.is_banned ? '已封禁' : '正常'), target.is_banned ? 'error' : 'info');
-                    this.log('注册时间: ' + new Date(target.created_at).toLocaleString(), 'info');
+                    this.log('注册时间: ' + STCBeijing.datetimeStr(target.created_at), 'info');
                     this.log('================', 'system');
                 }).catch(e=>this.log('获取失败: '+e.message,'error'));
                 break;
@@ -843,7 +1187,7 @@ const CMDLog = {
 
     log(message, type = 'info') {
         const entry = {
-            time: new Date().toLocaleTimeString(),
+            time: window.STCBeijing ? STCBeijing.timeStr() : new Date().toLocaleTimeString(),
             message: message,
             type: type
         };
@@ -890,70 +1234,6 @@ const CMDLog = {
         if (terminal) {
             terminal.style.display = 'flex';
         }
-    },
-
-    connectToServerLogs() {
-        if (this.logStream) {
-            try { this.logStream.cancel(); } catch(e) {}
-        }
-        
-        const connect = async () => {
-            try {
-                const response = await fetch('/api/logs/sse', {
-                    method: 'GET',
-                    credentials: 'include',
-                    headers: {
-                        'Accept': 'text/event-stream'
-                    }
-                });
-                
-                if (!response.ok) {
-                    this.log('日志连接失败: ' + response.status, 'error');
-                    setTimeout(connect, 5000);
-                    return;
-                }
-                
-                this.log('服务器日志连接已建立', 'system');
-                
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-                
-                while (true) {
-                    const { done, value } = await reader.read();
-                    
-                    if (done) {
-                        this.log('服务器日志连接已关闭，正在重连...', 'warn');
-                        setTimeout(connect, 5000);
-                        return;
-                    }
-                    
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n\n');
-                    buffer = lines.pop() || '';
-                    
-                    for (const line of lines) {
-                        const trimmedLine = line.trim();
-                        if (!trimmedLine) continue;
-                        
-                        if (trimmedLine.startsWith('data: ')) {
-                            const dataStr = trimmedLine.slice(6);
-                            try {
-                                const data = JSON.parse(dataStr);
-                                this.log(data.message, data.type || 'info');
-                            } catch (e) {
-                                this.log(dataStr, 'info');
-                            }
-                        }
-                    }
-                }
-            } catch (e) {
-                this.log('日志连接错误: ' + e.message, 'error');
-                setTimeout(connect, 5000);
-            }
-        };
-        
-        connect();
     }
 };
 
@@ -967,49 +1247,85 @@ function showMessage(message, type = 'success') {
     CMDLog.log(message, type === 'error' ? 'error' : 'info');
 }
 
-// 测试函数
-function testAction(userId) {
-    alert('测试按钮工作正常！用户ID: ' + userId);
-    console.log('测试按钮被点击，用户ID:', userId);
-    CMDLog.log('测试按钮被点击，用户ID: ' + userId, 'info');
+// 全局 HTML 转义：管理面板渲染用户可控内容时使用，防 XSS
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = (text == null ? '' : String(text));
+    return div.innerHTML;
 }
 
-// 清除日志函数
-function clearLogs() {
-    CMDLog.clear();
+// 生成安全的单引号 JS 字符串字面量（用于拼接进 HTML onclick 属性）
+function jsStrForAttr(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/'/g, "\\'");
 }
 
 // 封装的fetch函数
+// 获取一次性 CSRF Token
+let _adminCsrfCache = null;
+async function getCSRFTokenOnce() {
+    try {
+        // 必须绕开缓存：CSRF token 是一次性的，浏览器 / CDN 若复用了已用过的旧 token，
+        // 所有写请求（删除公告、删除任务等）都会统一 403，表现为"点了删除毫无反应"。
+        const resp = await fetch('/api/csrf-token?_t=' + Date.now(), { cache: 'no-store', credentials: 'include' });
+        if (resp.ok) {
+            const data = await resp.json();
+            _adminCsrfCache = data.csrfToken;
+            return data.csrfToken;
+        }
+    } catch (e) {
+        console.error('获取CSRF token失败:', e);
+    }
+    return null;
+}
+
+// 生成请求 nonce
+function genNonce() {
+    return Date.now().toString(36) + Math.random().toString(16).slice(2, 10);
+}
+
 async function fetchWithAuth(url, options = {}) {
     options.credentials = 'include';
     options.headers = options.headers || {};
     options.headers['Accept'] = 'application/json';
 
+    // 登录态已改为服务端 httpOnly cookie（options.credentials='include' 自动携带），前端不再持有 token；
+    // 顺手清掉旧版本留在 localStorage 里的 token，避免被 XSS 捡走
+    try { localStorage.removeItem('stc_auth_token'); } catch (e) {}
+
+    // 写请求：每次都拿新的一次性 CSRF token + 生成唯一 nonce
+    const method = (options.method || 'GET').toUpperCase();
+    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+        const csrf = await getCSRFTokenOnce();
+        const nonce = genNonce();
+        if (csrf) options.headers['X-CSRF-Token'] = csrf;
+        options.headers['X-Request-Nonce'] = nonce;
+        _adminCsrfCache = null;
+    }
+
     const response = await fetch(url, options);
     if (response.status === 401) {
-        showMessage('请先登录', 'error');
-        localStorage.removeItem('user');
-        setTimeout(() => window.location.href = '/login', 2000);
         throw new Error('Unauthorized');
     }
     if (response.status === 403) {
-        const error = await response.json();
-        const errorMsg = error.error || '';
-        if (errorMsg.includes('请先登录') || errorMsg.includes('未登录')) {
-            showMessage('登录已过期，请重新登录', 'error');
-            localStorage.removeItem('user');
-            setTimeout(() => window.location.href = '/login', 2000);
-            throw new Error('Unauthorized');
-        } else {
-            showMessage(errorMsg || '权限不足', 'error');
-            throw new Error('PermissionDenied');
-        }
+        // 保留 PermissionDenied 标识供调用方判断，同时附带服务端的具体原因
+        // （如"CSRF Token无效或已过期"、"不能操作超级管理员"），便于定位问题
+        let detail = '';
+        try {
+            const d = await response.clone().json();
+            detail = d.message || d.error || '';
+        } catch (e) { /* 忽略解析失败 */ }
+        throw new Error(detail ? ('PermissionDenied: ' + detail) : 'PermissionDenied');
     }
     return response;
 }
 
 // 登出
 async function logout() {
+    // 登录态 cookie 由服务端在 /api/logout 里清除
     const response = await fetchWithAuth('/api/logout', { method: 'POST' });
     if (response.ok) {
         showMessage('登出成功');
@@ -1020,7 +1336,6 @@ async function logout() {
 
 // 显示成员操作模态框
 function showMemberActions(userId, username, isBanned, isAdmin, isSuperAdmin) {
-    console.log('showMemberActions被调用', {userId, username, isBanned, isAdmin, isSuperAdmin});
     CMDLog.log(`打开用户 ${username} 的操作菜单`, 'info');
     
     // 移除已存在的模态框
@@ -1033,7 +1348,7 @@ function showMemberActions(userId, username, isBanned, isAdmin, isSuperAdmin) {
         modal.style.display = 'flex';
         modal.style.zIndex = '9999';
         modal.innerHTML = '<div class="modal-content" style="background:white;padding:20px;border-radius:8px;min-width:300px;">' +
-            '<h3 style="margin:0 0 15px 0;color:#333;">操作 - ' + username + '</h3>' +
+            '<h3 style="margin:0 0 15px 0;color:#333;">操作 - ' + escapeHtml(username) + '</h3>' +
             '<div class="modal-actions" id="modal-actions" style="display:flex;flex-direction:column;gap:10px;"></div>' +
             '<button onclick="this.closest(\'.modal-overlay\').remove()" class="btn btn-secondary" style="margin-top:15px;">关闭</button>' +
             '</div>';
@@ -1056,13 +1371,12 @@ function showMemberActions(userId, username, isBanned, isAdmin, isSuperAdmin) {
 
             actionsContainer.innerHTML += '<button style="' + btnStyle + '" onclick="resetPassword(' + userId + ')">重置密码</button>';
 
-            actionsContainer.innerHTML += '<button style="' + btnStyle + 'background:#dc3545;" onclick="deleteMember(' + userId + ', \'' + username.replace(/'/g, "\\'") + '\')">删除成员</button>';
+            actionsContainer.innerHTML += '<button style="' + btnStyle + 'background:#dc3545;" onclick="deleteMember(' + userId + ', \'' + jsStrForAttr(username) + '\')">删除成员</button>';
         } else {
             actionsContainer.innerHTML += '<p style="color:#666;margin:0;">您无法对该管理员执行操作</p>';
         }
 
         document.body.appendChild(modal);
-        console.log('模态框已添加到DOM');
     } catch (error) {
         console.error('showMemberActions错误:', error);
         alert('错误: ' + error.message);
@@ -1073,10 +1387,10 @@ function showMemberActions(userId, username, isBanned, isAdmin, isSuperAdmin) {
 async function toggleBan(userId, ban) {
     CMDLog.log(`正在${ban ? '封禁' : '解除封禁'}用户ID: ${userId}`, 'info');
     try {
-        var response = await fetchWithAuth('/api/members/' + userId + '/ban', {
+        var url = '/api/members/' + userId + (ban ? '/ban' : '/unban');
+        var response = await fetchWithAuth(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ban: ban })
+            headers: { 'Content-Type': 'application/json' }
         });
         if (response.ok) {
             showMessage(ban ? '用户已被封禁' : '用户已解除封禁', 'success');
@@ -1084,13 +1398,14 @@ async function toggleBan(userId, ban) {
             loadMembers();
             document.querySelector('.modal-overlay')?.remove();
         } else {
-            var data = await response.json();
-            showMessage(data.error || '操作失败', 'error');
-            CMDLog.log(`操作失败: ${data.error || '未知错误'}`, 'error');
+            var data = await response.json().catch(() => ({}));
+            var errMsg = data.message || data.error || ('操作失败（HTTP ' + response.status + '）');
+            showMessage(errMsg, 'error');
+            CMDLog.log(`封禁操作失败: ${errMsg}`, 'error');
         }
     } catch (error) {
-        showMessage('操作失败', 'error');
-        CMDLog.log(`操作失败: ${error.message}`, 'error');
+        showMessage('操作失败: ' + (error.message || '网络错误'), 'error');
+        CMDLog.log(`封禁操作失败: ${error.message}`, 'error');
     }
 }
 
@@ -1119,17 +1434,25 @@ async function toggleAdmin(userId, admin) {
     }
 }
 
-// 重置密码
+// 重置密码：由管理员设置新密码（不再内置默认弱口令）
 async function resetPassword(userId) {
+    const newPassword = prompt('请输入该用户的新密码（至少 6 位）：');
+    if (newPassword === null) return; // 用户取消
+    const pwd = String(newPassword || '').trim();
+    if (pwd.length < 6) {
+        showMessage('密码长度至少6位', 'error');
+        return;
+    }
     CMDLog.log(`正在重置用户ID ${userId} 的密码`, 'info');
-    if (!confirm('确定要重置密码吗？')) return;
     try {
         var response = await fetchWithAuth('/api/members/' + userId + '/reset-password', {
-            method: 'PUT'
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ newPassword: pwd })
         });
         if (response.ok) {
-            showMessage('密码已重置为123456', 'success');
-            CMDLog.log(`用户ID ${userId} 的密码已重置为123456`, 'info');
+            showMessage('密码已重置成功', 'success');
+            CMDLog.log(`用户ID ${userId} 的密码已重置`, 'info');
             document.querySelector('.modal-overlay')?.remove();
         } else {
             var data = await response.json();
@@ -1243,14 +1566,14 @@ async function loadMembers() {
             members.map(function(m) {
                 var role = m.is_super_admin ? '超级管理员' : (m.is_admin ? '管理员' : '普通用户');
                 var status = m.is_banned ? '已封禁' : '正常';
-                var escapedUsername = m.username.replace(/'/g, "\\'");
-                var actionBtn = '<button class="btn btn-sm" onclick="showMemberActions(' + m.id + ', \'' + escapedUsername + '\', ' + m.is_banned + ', ' + m.is_admin + ', ' + (m.is_super_admin || false) + ')">操作</button>';
+                var escName = escapeHtml(m.username);
+                var actionBtn = '<button class="btn btn-sm" onclick="showMemberActions(' + m.id + ', \'' + jsStrForAttr(m.username) + '\', ' + m.is_banned + ', ' + m.is_admin + ', ' + (m.is_super_admin || false) + ')">操作</button>';
                 return '<tr>' +
-                    '<td>' + m.username + '</td>' +
-                    '<td>' + m.email + '</td>' +
+                    '<td>' + escName + '</td>' +
+                    '<td>' + escapeHtml(m.email) + '</td>' +
                     '<td>' + role + '</td>' +
                     '<td>' + status + '</td>' +
-                    '<td style="color:#888;font-size:11px;">' + (m.last_login_ip || '无') + '</td>' +
+                    '<td style="color:#888;font-size:11px;">' + escapeHtml(m.last_login_ip || '无') + '</td>' +
                     '<td>' + actionBtn + '</td>' +
                     '</tr>';
             }).join('') +
@@ -1269,15 +1592,16 @@ async function loadTasks() {
     const container = document.getElementById('tasks-table');
     if (!container) return;
     try {
-        const response = await fetchWithAuth('/api/tasks');
+        const response = await fetchWithAuth('/api/tasks?_t=' + Date.now(), { cache: 'no-store' });
         const result = await response.json();
         const tasks = result.data || [];
         if (tasks.length === 0) {
             container.innerHTML = '<p style="text-align:center;">暂无任务</p>';
             return;
         }
-        container.innerHTML = '<table class="admin-table"><thead><tr><th>标题</th><th>状态</th><th>创建时间</th></tr></thead><tbody>' +
-            tasks.map(t => '<tr><td>' + (t.title || '') + '</td><td>' + (t.status || 'pending') + '</td><td>' + (t.created_at || '') + '</td></tr>').join('') +
+        // 显示任务 ID：排查"删除不生效"时可直接在终端执行 deltask <ID>
+        container.innerHTML = '<table class="admin-table"><thead><tr><th>ID</th><th>标题</th><th>状态</th><th>创建时间</th></tr></thead><tbody>' +
+            tasks.map(t => '<tr><td>' + escapeHtml(String(t.id)) + '</td><td>' + escapeHtml(t.title || '') + '</td><td>' + escapeHtml(t.status || 'pending') + '</td><td>' + escapeHtml(t.created_at || '') + '</td></tr>').join('') +
             '</tbody></table>';
         CMDLog.log('任务列表已刷新', 'info');
     } catch (error) {
@@ -1300,7 +1624,7 @@ async function loadMessages() {
             return;
         }
         container.innerHTML = '<table class="admin-table"><thead><tr><th>内容</th><th>创建时间</th></tr></thead><tbody>' +
-            messages.map(m => '<tr><td>' + (m.content || '') + '</td><td>' + (m.created_at || '') + '</td></tr>').join('') +
+            messages.map(m => '<tr><td>' + escapeHtml(m.content || '') + '</td><td>' + escapeHtml(m.created_at || '') + '</td></tr>').join('') +
             '</tbody></table>';
         CMDLog.log('留言列表已刷新', 'info');
     } catch (error) {
@@ -1310,11 +1634,112 @@ async function loadMessages() {
     }
 }
 
-// 加载待审核头像
-async function loadPendingAvatars() {
-    const container = document.getElementById('pending-avatars-table');
+// ============================================================
+// 公告管理（管理员发布 / 删除，主页展示，登录用户弹窗提醒）
+// ============================================================
+async function loadAnnouncements() {
+    const container = document.getElementById('announcements-table');
     if (!container) return;
-    container.innerHTML = '<p style="text-align:center;">暂无待审核头像</p>';
+    try {
+        // 带时间戳绕开浏览器 / CDN 缓存：否则"删除成功但列表还是旧的"会被误判为删除失败
+        const response = await fetchWithAuth('/api/announcements?_t=' + Date.now());
+        if (!response.ok) throw new Error('load failed (HTTP ' + response.status + ')');
+        const result = await response.json();
+        const announcements = result.data || [];
+        if (announcements.length === 0) {
+            container.innerHTML = '<p style="text-align:center;">暂无公告</p>';
+            return;
+        }
+        // 显示公告 ID：删除不生效时可直接在终端执行 delannounce <ID> 自检
+        container.innerHTML = '<table class="admin-table"><thead><tr><th>ID</th><th>标题</th><th>内容</th><th>发布人</th><th>发布时间</th><th>操作</th></tr></thead><tbody>' +
+            announcements.map(a => {
+                const rawId = (a && a.id != null) ? String(a.id) : '';
+                const hasId = !!rawId && rawId !== 'undefined' && rawId !== 'null';
+                const content = escapeHtml(a.content || '').replace(/\n/g, '<br>');
+                const action = hasId
+                    ? '<button class="btn btn-sm" style="color:var(--error,#f85149);" onclick="deleteAnnouncement(\'' + jsStrForAttr(rawId) + '\')">删除</button>'
+                    : '<span style="color:var(--warning,#d29922);font-size:12px;" title="该公告在数据库中缺少 id 字段，服务端下次启动会自动补全">ID 缺失</span>';
+                return '<tr><td>' + escapeHtml(hasId ? rawId : '—') + '</td>' +
+                    '<td><b>' + escapeHtml(a.title || '') + '</b></td>' +
+                    '<td style="max-width:360px;">' + content + '</td>' +
+                    '<td>' + escapeHtml(a.created_by || '管理员') + '</td>' +
+                    '<td style="white-space:nowrap;">' + escapeHtml(a.created_at || '') + '</td>' +
+                    '<td>' + action + '</td></tr>';
+            }).join('') +
+            '</tbody></table>';
+        CMDLog.log('公告列表已刷新，共 ' + announcements.length + ' 条', 'info');
+    } catch (error) {
+        console.error('Failed to load announcements:', error);
+        container.innerHTML = '<p style="text-align:center;color:var(--error,#f85149);">加载公告失败</p>';
+        CMDLog.log('公告列表加载失败: ' + error.message, 'error');
+    }
+}
+
+// 发布公告（管理员）
+async function createAnnouncement() {
+    const titleEl = document.getElementById('announcement-title');
+    const contentEl = document.getElementById('announcement-content');
+    const title = ((titleEl && titleEl.value) || '').trim();
+    const content = ((contentEl && contentEl.value) || '').trim();
+    if (!title) { alert('请填写公告标题'); return; }
+    if (!content) { alert('请填写公告内容'); return; }
+    try {
+        const response = await fetchWithAuth('/api/announcements', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title, content })
+        });
+        if (response.ok) {
+            if (titleEl) titleEl.value = '';
+            if (contentEl) contentEl.value = '';
+            CMDLog.log('公告发布成功', 'info');
+            loadAnnouncements();
+        } else {
+            const data = await response.json().catch(() => ({}));
+            alert(data.message || data.error || '发布失败');
+            CMDLog.log('公告发布失败: ' + (data.message || data.error || response.status), 'error');
+        }
+    } catch (error) {
+        console.error('Failed to create announcement:', error);
+        CMDLog.log('公告发布失败: ' + error.message, 'error');
+    }
+}
+
+// 删除公告（管理员）
+async function deleteAnnouncement(id) {
+    const rawId = (id == null) ? '' : String(id).trim();
+    if (!rawId || rawId === 'undefined' || rawId === 'null') {
+        alert('这条公告在数据库里缺少 ID，无法删除。请刷新页面后重试，若仍不行请把此提示告知开发者。');
+        CMDLog.log('公告删除中止：ID 无效 (' + rawId + ')', 'error');
+        return;
+    }
+    if (!confirm('确定要删除这条公告吗？发布后用户将不再看到它。')) return;
+    try {
+        const response = await fetchWithAuth('/api/announcements/' + encodeURIComponent(rawId), { method: 'DELETE' });
+        if (response.ok) {
+            CMDLog.log('公告已删除 #' + rawId, 'info');
+            loadAnnouncements();
+        } else {
+            const data = await response.json().catch(() => ({}));
+            const why = data.message || data.error || ('HTTP ' + response.status);
+            alert('删除失败：' + why);
+            CMDLog.log('公告删除失败: HTTP ' + response.status + ' ' + why, 'error');
+        }
+    } catch (error) {
+        // fetchWithAuth 对 401/403 直接抛错：必须把原因显示出来，
+        // 否则页面上表现为"点了删除完全没反应"，无从定位。
+        const msg = String((error && error.message) || error);
+        let tip = msg;
+        if (msg.indexOf('PermissionDenied') >= 0) {
+            const detail = msg.replace('PermissionDenied', '').trim();
+            tip = '请求被拒绝（403）' + (detail ? '：' + detail : '') +
+                '。多为登录状态或 CSRF 校验失效，请刷新页面（必要时重新登录）后再试。';
+        } else if (msg === 'Unauthorized') {
+            tip = '登录状态已失效（401），请重新登录后再试。';
+        }
+        alert('删除失败：' + tip);
+        CMDLog.log('公告删除失败: ' + tip, 'error');
+    }
 }
 
 // 加载登录状态
@@ -1329,10 +1754,10 @@ async function loadLoginStatus() {
         if (user && user.id) {
             const role = user.is_super_admin ? '超级管理员' : (user.is_admin ? '管理员' : '普通用户');
             container.innerHTML = '<div style="padding:10px;background:#f0f9ff;border-radius:5px;">' +
-                '<strong>用户名:</strong> ' + user.username + '<br>' +
-                '<strong>邮箱:</strong> ' + user.email + '<br>' +
-                '<strong>角色:</strong> ' + role + '<br>' +
-                '<strong>ID:</strong> ' + user.id +
+                '<strong>用户名:</strong> ' + escapeHtml(user.username) + '<br>' +
+                '<strong>邮箱:</strong> ' + escapeHtml(user.email) + '<br>' +
+                '<strong>角色:</strong> ' + escapeHtml(role) + '<br>' +
+                '<strong>ID:</strong> ' + escapeHtml(user.id) +
                 '</div>';
             CMDLog.log('登录状态: ' + user.username + ' (' + role + ')', 'info');
         } else {
@@ -1340,7 +1765,7 @@ async function loadLoginStatus() {
             CMDLog.log('未登录', 'warn');
         }
     } catch (error) {
-        container.innerHTML = '<div style="padding:10px;background:#fee;border-radius:5px;color:red;">加载失败: ' + error.message + '</div>';
+        container.innerHTML = '<div style="padding:10px;background:#fee;border-radius:5px;color:red;">加载失败: ' + escapeHtml(error.message) + '</div>';
         CMDLog.log('登录状态加载失败: ' + error.message, 'error');
     }
 }
@@ -1357,7 +1782,7 @@ async function initAdminPanel() {
             loadTasks().catch(e => CMDLog.log('任务加载失败: ' + e.message, 'error')),
             loadMessages().catch(e => CMDLog.log('留言加载失败: ' + e.message, 'error')),
             loadInviteCodes().catch(e => CMDLog.log('邀请码加载失败: ' + e.message, 'error')),
-            loadPendingAvatars().catch(e => CMDLog.log('头像审核加载失败: ' + e.message, 'error'))
+            loadAnnouncements().catch(e => CMDLog.log('公告加载失败: ' + e.message, 'error'))
         ]);
         CMDLog.log('管理面板数据加载完成', 'system');
     } catch (error) {
@@ -1365,116 +1790,553 @@ async function initAdminPanel() {
     }
 }
 
-// 服务器日志功能
-let logStreamActive = false;
-let logStream = null;
+// ============================================================
+// IP → 页面 访问记录
+// ============================================================
+let accessAutoRefreshTimer = null;
 
-function appendServerLog(entry) {
-    const container = document.getElementById('server-logs-container');
+function accessEsc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function formatAccessTime(ts) {
+    if (!ts) return '';
+    try {
+        // 统一按北京时间显示（见 js/bj-time.js）
+        if (window.STCBeijing) return STCBeijing.datetimeStr(ts);
+
+        const d = new Date(ts);
+        const pad = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    } catch (e) { return ''; }
+}
+
+async function loadAccessLogs() {
+    const container = document.getElementById('access-logs-container');
     if (!container) return;
-    
-    const time = entry.time ? new Date(entry.time).toLocaleTimeString() : '';
-    const type = entry.type || 'info';
-    const message = entry.message || '';
-    
-    const colors = {
-        'error': '#ff6b6b',
-        'warn': '#ffd93d',
-        'success': '#6bcb77',
-        'system': '#4d96ff',
-        'info': '#eeeeee'
-    };
-    const color = colors[type] || '#eeeeee';
-    
-    const div = document.createElement('div');
-    div.style.marginBottom = '2px';
-    div.innerHTML = `<span style="color:#8b949e;">[${time}]</span> <span style="color:${color};">${escapeHtml(message)}</span>`;
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
-}
-
-function clearServerLogs() {
-    const container = document.getElementById('server-logs-container');
-    if (container) {
-        container.innerHTML = '<div style=\'color:#8b949e;\'>日志已清空</div>';
-    }
-}
-
-async function loadServerLogs() {
     try {
-        const response = await fetchWithAuth('/api/logs');
-        const data = await response.json();
-        
-        if (data.success && data.data) {
-            const container = document.getElementById('server-logs-container');
-            container.innerHTML = '';
-            data.data.forEach(entry => appendServerLog(entry));
+        const resp = await fetchWithAuth('/api/access-logs?limit=200');
+        const data = await resp.json();
+        if (!data.success) {
+            container.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${accessEsc(data.message || '未知错误')}</div>`;
+            return;
         }
-    } catch (error) {
-        console.error('加载日志失败:', error);
-    }
-}
-
-async function toggleLogStream() {
-    const btn = document.getElementById('log-stream-btn');
-    
-    if (logStreamActive) {
-        if (logStream) {
-            try { logStream.cancel(); } catch(e) {}
-            logStream = null;
+        const logs = data.data || [];
+        const bannedSet = new Set(data.banned || []);
+        const devBannedSet = new Set(data.bannedDevices || []);
+        const countEl = document.getElementById('access-count');
+        if (countEl) {
+            let countTxt = `共 ${logs.length} 条 · 封禁 IP ${bannedSet.size} 个 · 设备 ${devBannedSet.size} 个`;
+            // 显示"清空水位线"：清空之后产生的新访问会照常记录，写清楚免得看着像"没清掉"
+            const clearedAt = Number(data.clearedAt) || 0;
+            if (clearedAt > 0) {
+                const t = (window.STCBeijing && STCBeijing.datetimeStr)
+                    ? STCBeijing.datetimeStr(clearedAt)
+                    : new Date(clearedAt).toLocaleString();
+                countTxt += ` · 清空于 ${t}（之后的新访问仍会记录）`;
+            }
+            countEl.textContent = countTxt;
         }
-        logStreamActive = false;
-        if (btn) btn.textContent = '启动实时日志';
-        return;
-    }
-    
-    try {
-        logStreamActive = true;
-        if (btn) btn.textContent = '停止实时日志';
-        
-        const response = await fetchWithAuth('/api/logs/sse');
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        
-        while (logStreamActive) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n\n');
-            buffer = lines.pop() || '';
-            
-            for (const line of lines) {
-                const dataMatch = line.match(/^data: (.+)$/);
-                if (dataMatch) {
-                    try {
-                        const entry = JSON.parse(dataMatch[1]);
-                        appendServerLog(entry);
-                    } catch (e) {}
+        if (logs.length === 0) {
+            container.innerHTML = '<div style="color:#8b949e; padding:8px;">暂无访问记录</div>';
+            return;
+        }
+        // 全部改用主题变量（--text-primary / --error 等），否则深色主题下
+        // 深灰色文字（#24292f）会与深色面板背景（--bg-2）几乎同色，IP 根本看不清
+        let html = '<table style="width:100%; border-collapse:collapse; font-size:13px;"><thead><tr style="text-align:left; color:var(--text-tertiary, #64748b);">'
+            + '<th style="padding:6px 8px; border-bottom:1px solid var(--border-base, rgba(255,255,255,0.11));">时间</th>'
+            + '<th style="padding:6px 8px; border-bottom:1px solid var(--border-base, rgba(255,255,255,0.11));">IP</th>'
+            + '<th style="padding:6px 8px; border-bottom:1px solid var(--border-base, rgba(255,255,255,0.11));">设备指纹</th>'
+            + '<th style="padding:6px 8px; border-bottom:1px solid var(--border-base, rgba(255,255,255,0.11));">页面</th>'
+            + '<th style="padding:6px 8px; border-bottom:1px solid var(--border-base, rgba(255,255,255,0.11));">来源 (User-Agent)</th>'
+            + '<th style="padding:6px 8px; border-bottom:1px solid var(--border-base, rgba(255,255,255,0.11));">操作</th>'
+            + '</tr></thead><tbody>';
+        const seenIp = {};
+        logs.forEach(log => {
+            const ip = log.ip || '';
+            const fp = log.fp || '';
+            const isBanned = bannedSet.has(ip);
+            const isDevBanned = !!fp && devBannedSet.has(fp);
+            const rowKey = ip || ('p' + (log.page || ''));
+            const isFirst = !seenIp[rowKey];
+            seenIp[rowKey] = true;
+            const ipBadge = isBanned
+                ? ' <span style="color:var(--error, #f87171); font-size:11px; border:1px solid currentColor; border-radius:4px; padding:0 4px;">已封禁</span>'
+                : '';
+            const devBadge = isDevBanned
+                ? ' <span style="color:var(--warning, #fbbf24); font-size:11px; border:1px solid currentColor; border-radius:4px; padding:0 4px;">已封设备</span>'
+                : '';
+            const devCell = fp
+                ? `<span style="font-family:monospace; white-space:nowrap; color:${isDevBanned ? 'var(--warning, #fbbf24)' : 'var(--text-secondary, #9ca8c2)'};" title="${accessEsc(fp)}">${accessEsc(fp.slice(0, 8))}…</span>${devBadge}`
+                : '<span style="color:var(--text-muted, #4e5b7a);">—</span>';
+            // 操作按钮：IP 级 + 设备级各一（只在该 IP 首次出现的行显示）
+            const ops = [];
+            if (isFirst && ip) {
+                if (!isBanned) {
+                    ops.push(`<button onclick="banAccessIP('${ip.replace(/'/g, '')}')" style="padding:2px 10px; font-size:12px; border:1px solid var(--error, #f87171); color:var(--error, #f87171); background:var(--error-soft, rgba(248,113,113,0.12)); border-radius:4px; cursor:pointer;">封禁IP</button>`);
+                } else {
+                    ops.push(`<button onclick="unbanAccessIP('${ip.replace(/'/g, '')}')" style="padding:2px 10px; font-size:12px; border:1px solid var(--border-strong, rgba(255,255,255,0.18)); color:var(--text-secondary, #9ca8c2); background:transparent; border-radius:4px; cursor:pointer;">解封IP</button>`);
+                }
+                if (fp) {
+                    if (!isDevBanned) {
+                        ops.push(`<button onclick="banDevice('${fp}', '${ip.replace(/'/g, '')}')" style="padding:2px 10px; font-size:12px; border:1px solid var(--warning, #fbbf24); color:var(--warning, #fbbf24); background:var(--warning-soft, rgba(251,191,36,0.12)); border-radius:4px; cursor:pointer;">封禁设备</button>`);
+                    } else {
+                        ops.push(`<button onclick="unbanDevice('${fp}')" style="padding:2px 10px; font-size:12px; border:1px solid var(--border-strong, rgba(255,255,255,0.18)); color:var(--text-secondary, #9ca8c2); background:transparent; border-radius:4px; cursor:pointer;">解封设备</button>`);
+                    }
                 }
             }
-        }
-    } catch (error) {
-        logStreamActive = false;
-        if (btn) btn.textContent = '启动实时日志';
-        console.error('日志流错误:', error);
+            const opCell = ops.join('&nbsp; ');
+            const rowTint = isBanned
+                ? 'var(--error-soft, rgba(248,113,113,0.12))'
+                : (isDevBanned ? 'var(--warning-soft, rgba(251,191,36,0.12))' : '');
+            const rowStyle = 'border-bottom:1px solid var(--border-subtle, rgba(255,255,255,0.07));' + (rowTint ? ' background:' + rowTint + ';' : '');
+            html += '<tr style="' + rowStyle + '">'
+                + `<td style="padding:5px 8px; white-space:nowrap; color:var(--text-secondary, #9ca8c2);">${accessEsc(formatAccessTime(log.ts || log.t))}</td>`
+                + `<td style="padding:5px 8px; font-family:monospace; white-space:nowrap; color:${isBanned ? 'var(--error, #f87171)' : 'var(--text-primary, #f1f5f9)'}; font-weight:${isBanned ? 'bold' : 'normal'};">${accessEsc(ip)}${ipBadge}</td>`
+                + `<td style="padding:5px 8px;">${devCell}</td>`
+                + `<td style="padding:5px 8px; white-space:nowrap;"><a href="${accessEsc(log.page)}" style="color:var(--accent-light, #818cf8); text-decoration:none;">${accessEsc(log.page)}</a></td>`
+                + `<td style="padding:5px 8px; color:var(--text-tertiary, #64748b); max-width:330px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${accessEsc(log.ua || '')}">${accessEsc(log.ua || '')}</td>`
+                + `<td style="padding:5px 8px; white-space:nowrap;">${opCell}</td>`
+                + '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+        loadBannedIPs();
+        loadBannedDevices();
+    } catch (e) {
+        container.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${accessEsc(e.message)}</div>`;
     }
 }
 
-// 页面加载完成后初始化
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        setTimeout(() => {
-            CMDLog.init();
-            initAdminPanel();
-            loadServerLogs();
-        }, 500);
-    });
-} else {
+// 加载"已封禁 IP"管理条（仅超管可查看；普通管理员无权限时自动隐藏）
+async function loadBannedIPs() {
+    const bar = document.getElementById('banned-ips-bar');
+    const list = document.getElementById('banned-ips-list');
+    if (!bar || !list) return;
+    try {
+        const resp = await fetchWithAuth('/api/ban-ips');
+        if (!resp.ok) { bar.style.display = 'none'; return; }
+        const data = await resp.json();
+        if (!data.success) { bar.style.display = 'none'; return; }
+        const arr = Array.isArray(data.data) ? data.data : [];
+        bar.style.display = 'block';
+        const cnt = document.getElementById('banned-ips-count');
+        if (cnt) cnt.textContent = `（${arr.length}）`;
+        if (arr.length === 0) {
+            list.innerHTML = '<span style="color:var(--text-tertiary, #64748b); font-size:12px;">暂无封禁</span>';
+            return;
+        }
+        list.innerHTML = arr.map(b => {
+            const ip = String(b.ip || '').replace(/'/g, '');
+            const reason = String(b.reason || '违规操作');
+            const t = b.banned_at ? ' · ' + formatAccessTime(b.banned_at) : '';
+            const title = accessEsc(reason + t);
+            // 用主题变量着色：深色主题下 --error 是亮红，浅色主题下是深红，都能看清 IP
+            return `<span style="display:inline-flex; align-items:center; gap:6px; background:var(--error-soft, rgba(248,113,113,0.12)); border:1px solid var(--error, #f87171); color:var(--error, #f87171); border-radius:6px; padding:3px 8px; font-size:12px; max-width:100%;">
+                <span style="font-family:monospace; white-space:nowrap; font-weight:600;">${accessEsc(b.ip)}</span>
+                <span title="${title}" style="max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-secondary, #9ca8c2);">${accessEsc(reason)}</span>
+                <button onclick="unbanAccessIP('${ip}')" style="padding:0 7px; font-size:11px; border:1px solid currentColor; color:var(--error, #f87171); background:transparent; border-radius:4px; cursor:pointer; line-height:18px;">解封</button>
+            </span>`;
+        }).join('');
+    } catch (e) {
+        // 403 无权限或网络错误：隐藏封禁管理条，不影响访问记录
+        bar.style.display = 'none';
+    }
+}
+
+async function clearAccessLogs() {
+    if (!confirm('确定清空所有访问记录？')) return;
+    try {
+        const resp = await fetchWithAuth('/api/access-logs', { method: 'DELETE' });
+        const data = await resp.json();
+        if (data.success) {
+            loadAccessLogs();
+        } else {
+            alert('清空失败: ' + (data.message || '未知错误'));
+        }
+    } catch (e) {
+        alert('清空失败: ' + e.message);
+    }
+}
+
+async function banAccessIP(ip) {
+    if (!ip) return;
+    const reason = prompt(`封禁 IP：${ip}\n请输入封禁原因（可留空）：`, '违规操作');
+    if (reason === null) return;
+    try {
+        const resp = await fetchWithAuth('/api/ban-ip', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip: ip, reason: (reason || '违规操作').slice(0, 100) })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            loadAccessLogs();
+        } else {
+            alert('封禁失败: ' + (data.message || '未知错误'));
+        }
+    } catch (e) {
+        alert(String(e.message || e).indexOf('PermissionDenied') >= 0
+            ? '没有权限封禁 IP：仅超级管理员可操作。'
+            : '封禁失败: ' + e.message);
+    }
+}
+
+async function unbanAccessIP(ip) {
+    if (!ip) return;
+    if (!confirm(`确定解封 IP：${ip}？`)) return;
+    try {
+        const resp = await fetchWithAuth('/api/unban-ip', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip: ip })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            loadAccessLogs();
+        } else {
+            alert('解封失败: ' + (data.message || '未知错误'));
+        }
+    } catch (e) {
+        alert(String(e.message || e).indexOf('PermissionDenied') >= 0
+            ? '没有权限解封 IP：仅超级管理员可操作。'
+            : '解封失败: ' + e.message);
+    }
+}
+
+// 加载"已封禁设备"管理条（仅超管可查看；普通管理员无权限时自动隐藏）
+async function loadBannedDevices() {
+    const bar = document.getElementById('banned-devices-bar');
+    const list = document.getElementById('banned-devices-list');
+    if (!bar || !list) return;
+    try {
+        const resp = await fetchWithAuth('/api/ban-devices');
+        if (!resp.ok) { bar.style.display = 'none'; return; }
+        const data = await resp.json();
+        if (!data.success) { bar.style.display = 'none'; return; }
+        const arr = Array.isArray(data.data) ? data.data : [];
+        bar.style.display = 'block';
+        const cnt = document.getElementById('banned-devices-count');
+        if (cnt) cnt.textContent = `（${arr.length}）`;
+        if (arr.length === 0) {
+            list.innerHTML = '<span style="color:var(--text-tertiary, #64748b); font-size:12px;">暂无封禁设备</span>';
+            return;
+        }
+        list.innerHTML = arr.map(b => {
+            const fp = String(b.fp || '').replace(/'/g, '');
+            const reason = String(b.reason || '违规操作');
+            const t = b.banned_at ? ' · ' + formatAccessTime(b.banned_at) : '';
+            const title = accessEsc(reason + t);
+            return `<span style="display:inline-flex; align-items:center; gap:6px; background:var(--warning-soft, rgba(251,191,36,0.12)); border:1px solid var(--warning, #fbbf24); color:var(--warning, #fbbf24); border-radius:6px; padding:3px 8px; font-size:12px; max-width:100%;">
+                <span style="font-family:monospace; white-space:nowrap; font-weight:600;">${accessEsc(b.fp)}</span>
+                <span title="${title}" style="max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-secondary, #9ca8c2);">${accessEsc(reason)}</span>
+                <button onclick="unbanDevice('${fp}')" style="padding:0 7px; font-size:11px; border:1px solid currentColor; color:var(--warning, #fbbf24); background:transparent; border-radius:4px; cursor:pointer; line-height:18px;">解封</button>
+            </span>`;
+        }).join('');
+    } catch (e) {
+        // 403 无权限或网络错误：隐藏封禁管理条，不影响访问记录
+        bar.style.display = 'none';
+    }
+}
+
+// 单独封禁一个设备（换网络/换 IP 仍会被拦截）
+async function banDevice(fp) {
+    if (!fp) return;
+    const reason = prompt(`封禁设备：${fp}\n该封禁与 IP/网络无关，对方更换网络、切换 IP 后仍会被拦截。\n请输入封禁原因（可留空）：`, '违规操作');
+    if (reason === null) return;
+    try {
+        const resp = await fetchWithAuth('/api/ban-device', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fp: fp, reason: (reason || '违规操作').slice(0, 100) })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            loadAccessLogs();
+        } else {
+            alert('封禁失败: ' + (data.message || '未知错误'));
+        }
+    } catch (e) {
+        alert(String(e.message || e).indexOf('PermissionDenied') >= 0
+            ? '没有权限封禁设备：仅超级管理员可操作。'
+            : '封禁失败: ' + e.message);
+    }
+}
+
+// 解封一个设备
+async function unbanDevice(fp) {
+    if (!fp) return;
+    if (!confirm(`确定解封设备：${fp}？解封后该设备即可正常访问。`)) return;
+    try {
+        const resp = await fetchWithAuth('/api/unban-device', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fp: fp })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            loadAccessLogs();
+        } else {
+            alert('解封失败: ' + (data.message || '未知错误'));
+        }
+    } catch (e) {
+        alert(String(e.message || e).indexOf('PermissionDenied') >= 0
+            ? '没有权限解封设备：仅超级管理员可操作。'
+            : '解封失败: ' + e.message);
+    }
+}
+
+function toggleAccessAutoRefresh() {
+    const chk = document.getElementById('access-auto-refresh');
+    const enabled = chk && chk.checked;
+    if (accessAutoRefreshTimer) { clearInterval(accessAutoRefreshTimer); accessAutoRefreshTimer = null; }
+    if (enabled) {
+        accessAutoRefreshTimer = setInterval(() => loadAccessLogs(), 20000);
+    }
+}
+
+// 页面加载完成后初始化（兼容 DOM 就绪的两种时序）
+function bootAdminPanel() {
     setTimeout(() => {
         CMDLog.init();
         initAdminPanel();
-        loadServerLogs();
+        loadAccessLogs();
+        toggleAccessAutoRefresh();
+        // 初始化机器人控制台
+        setupBotPanel();
+        loadBotStatus().catch(e => CMDLog.log('机器人状态加载失败: ' + e.message, 'warn'));
+        loadBotMessages().catch(e => CMDLog.log('机器人消息加载失败: ' + e.message, 'warn'));
     }, 500);
+}
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootAdminPanel);
+} else {
+    bootAdminPanel();
+}
+
+// ============================================================
+// QQ 机器人控制台
+// ============================================================
+
+function setupBotPanel() {
+    // 类型切换时标签跟着变
+    const typeSel = document.getElementById('bot-send-type');
+    const targetLabel = document.getElementById('bot-target-label');
+    if (typeSel && targetLabel) {
+        typeSel.addEventListener('change', () => {
+            targetLabel.textContent = typeSel.value === 'group' ? '群号' : 'QQ号';
+            const target = document.getElementById('bot-send-target');
+            if (target) target.placeholder = typeSel.value === 'group' ? '请输入群号' : '请输入QQ号';
+        });
+    }
+}
+
+async function loadBotStatus() {
+    const box = document.getElementById('bot-status');
+    try {
+        const resp = await fetchWithAuth('/api/bot/status');
+        const data = await resp.json();
+        if (!data.success) {
+            box.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${escapeHtml(data.message || '未知错误')}</div>`;
+            return;
+        }
+
+        const { instances, send_queue_size, received_messages_count } = data;
+        let html = `<div style="padding:12px; background:#f0f6ff; border-radius:8px; display:grid; grid-template-columns: repeat(auto-fit,minmax(160px,1fr)); gap:12px;">
+            <div><b>队列中消息：</b> ${send_queue_size}</div>
+            <div><b>已接收消息：</b> ${received_messages_count}</div>
+            <div><b>在线实例：</b> ${instances.filter(b => b.online).length} / ${instances.length}</div>
+        </div>`;
+
+        if (instances.length === 0) {
+            html += `<div style="margin-top:10px; padding:12px; background:#fff4e5; border-radius:8px; color:#b26a00;">
+                🔌 当前没有机器人在线，请确认 AstrBot 已启动并正确安装 stc_web_panel 插件，且配置了正确的 web_url 和 api_key。
+            </div>`;
+        } else {
+            html += `<div class="data-table" style="margin-top:12px;">
+                <div class="data-row data-header">
+                    <div>状态</div><div>平台</div><div>QQ号</div><div>昵称</div><div>会话数</div><div>最后心跳</div>
+                </div>`;
+            for (const b of instances) {
+                const badge = b.online
+                    ? '<span style="color:#2ea043;">● 在线</span>'
+                    : '<span style="color:#8b949e;">○ 离线</span>';
+                html += `<div class="data-row">
+                    <div>${badge}</div>
+                    <div>${escapeHtml(b.platform || '-')}</div>
+                    <div>${escapeHtml(b.bot_id || '-')}</div>
+                    <div>${escapeHtml(b.nickname || '-')}</div>
+                    <div>${b.session_count || 0}</div>
+                    <div>${escapeHtml(b.last_seen_str || '-')}</div>
+                </div>`;
+            }
+            html += `</div>`;
+        }
+
+        box.innerHTML = html;
+    } catch (e) {
+        box.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${escapeHtml(e.message)}</div>`;
+        throw e;
+    }
+}
+
+async function loadBotMessages(page = 1) {
+    const table = document.getElementById('bot-messages-table');
+    const type = document.getElementById('bot-msg-type')?.value || '';
+    const q = document.getElementById('bot-msg-search')?.value || '';
+
+    try {
+        const params = new URLSearchParams({ page, pageSize: 50 });
+        if (type) params.set('type', type);
+        if (q) params.set('q', q);
+
+        const resp = await fetchWithAuth(`/api/bot/messages?${params.toString()}`);
+        const data = await resp.json();
+        if (!data.success) {
+            table.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${escapeHtml(data.message || '未知错误')}</div>`;
+            return;
+        }
+
+        const { messages, total, page: curPage, pageSize } = data;
+
+        if (total === 0) {
+            table.innerHTML = `<div style="color:#8b949e; padding:20px; text-align:center;">暂无消息记录</div>`;
+            return;
+        }
+
+        let html = `<div style="margin-bottom:8px; color:#8b949e; font-size:13px;">共 ${total} 条消息</div>`;
+        html += `<div class="data-table">
+            <div class="data-row data-header">
+                <div>时间</div><div>类型</div><div>群</div><div>发送者</div><div>内容</div>
+            </div>`;
+
+        for (const m of messages) {
+            const typeLabel = m.message_type === 'group' ? '群聊' : '私聊';
+            const typeClass = m.message_type === 'group' ? 'label-blue' : 'label-green';
+            const groupCell = m.message_type === 'group'
+                ? `<div>${escapeHtml(m.group_name || m.group_id || '-')}<br><small style="color:#8b949e;">${escapeHtml(m.group_id || '')}</small></div>`
+                : '-';
+            const timeStr = m.timestamp ? STCBeijing.datetimeStr(m.timestamp) : '-';
+
+            let contentHtml = '';
+            if (m.message_text) {
+                contentHtml = `<div>${escapeHtml(m.message_text.substring(0, 300))}${m.message_text.length > 300 ? '...' : ''}</div>`;
+            }
+            if (m.images && m.images.length > 0) {
+                contentHtml += `<div style="margin-top:4px; display:flex; gap:4px; flex-wrap:wrap;">`;
+                for (const img of m.images.slice(0, 3)) {
+                    contentHtml += `<a href="${encodeURI(img)}" target="_blank"><img src="${encodeURI(img)}" style="max-width:100px; max-height:100px; border-radius:4px;"></a>`;
+                }
+                if (m.images.length > 3) contentHtml += `<span style="color:#8b949e;">+${m.images.length - 3} 张</span>`;
+                contentHtml += `</div>`;
+            }
+            if (!contentHtml) contentHtml = '<div style="color:#8b949e;">[空]</div>';
+
+            html += `<div class="data-row" style="vertical-align:top;">
+                <div style="min-width:140px;">${timeStr}</div>
+                <div><span class="badge ${typeClass}">${typeLabel}</span></div>
+                <div>${groupCell}</div>
+                <div>
+                    <div><b>${escapeHtml(m.sender_name || '-')}</b></div>
+                    <small style="color:#8b949e;">${escapeHtml(m.sender_id || '')}</small>
+                </div>
+                <div>${contentHtml}</div>
+            </div>`;
+        }
+        html += `</div>`;
+
+        // 分页
+        const totalPages = Math.ceil(total / pageSize);
+        if (totalPages > 1) {
+            html += `<div style="margin-top:10px; display:flex; gap:8px; justify-content:center;">`;
+            if (curPage > 1) html += `<button class="btn btn-secondary" onclick="loadBotMessages(${curPage - 1})">上一页</button>`;
+            html += `<span style="padding:6px 12px;">第 ${curPage} / ${totalPages} 页</span>`;
+            if (curPage < totalPages) html += `<button class="btn btn-secondary" onclick="loadBotMessages(${curPage + 1})">下一页</button>`;
+            html += `</div>`;
+        }
+
+        table.innerHTML = html;
+    } catch (e) {
+        table.innerHTML = `<div style="color:#ff6b6b;">加载失败: ${escapeHtml(e.message)}</div>`;
+        throw e;
+    }
+}
+
+async function sendBotMessage() {
+    const resultBox = document.getElementById('bot-send-result');
+    resultBox.innerHTML = '<div style="color:#8b949e;">发送中...</div>';
+
+    try {
+        const target_type = document.getElementById('bot-send-type').value;
+        const target_id = document.getElementById('bot-send-target').value.trim();
+        const content = document.getElementById('bot-send-content').value.trim();
+        const image_url = document.getElementById('bot-send-image').value.trim();
+
+        if (!target_id) {
+            resultBox.innerHTML = '<div style="color:#ff6b6b;">请填写目标ID (群号/QQ号)</div>';
+            return;
+        }
+        if (!content && !image_url) {
+            resultBox.innerHTML = '<div style="color:#ff6b6b;">请填写内容或图片</div>';
+            return;
+        }
+
+        const resp = await fetchWithAuth('/api/bot/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target_type, target_id, content, image_url })
+        });
+        const data = await resp.json();
+        if (!data.success) {
+            resultBox.innerHTML = `<div style="color:#ff6b6b;">❌ ${escapeHtml(data.message || '发送失败')}</div>`;
+            return;
+        }
+
+        resultBox.innerHTML = `<div style="color:#2ea043;">✅ ${escapeHtml(data.message || '发送成功')} (请求ID: <code>${data.request_id}</code>, 队列位置: ${data.queue_position})</div>`;
+        CMDLog.log(`机器人消息已入队 [${data.request_id}]`, 'success');
+
+        // 清空表单（保留目标ID，方便连续发）
+        document.getElementById('bot-send-content').value = '';
+        document.getElementById('bot-send-image').value = '';
+
+        // 尝试轮询发送结果
+        pollSendResult(data.request_id);
+
+    } catch (e) {
+        resultBox.innerHTML = `<div style="color:#ff6b6b;">❌ 请求失败: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function pollSendResult(requestId) {
+    const resultBox = document.getElementById('bot-send-result');
+    let attempts = 0;
+    const maxAttempts = 30;  // 最多等30次 * 2s = 60s
+
+    const timer = setInterval(async () => {
+        attempts++;
+        if (attempts > maxAttempts) {
+            clearInterval(timer);
+            return;
+        }
+        try {
+            const resp = await fetchWithAuth(`/api/bot/send-result/${encodeURIComponent(requestId)}`);
+            const data = await resp.json();
+            if (!data.success) return;
+
+            if (data.status === 'completed') {
+                clearInterval(timer);
+                const r = data.result;
+                if (r.success) {
+                    resultBox.innerHTML = `<div style="color:#2ea043;">✅ 机器人发送成功！(报告时间: ${window.STCBeijing ? STCBeijing.timeStr(r.reported_at) : new Date(r.reported_at).toLocaleTimeString()})</div>`;
+                } else {
+                    resultBox.innerHTML = `<div style="color:#ff6b6b;">⚠️ 机器人发送失败: ${escapeHtml(r.message || '未知错误')}</div>`;
+                }
+                loadBotStatus();
+            } else if (data.status === 'queued') {
+                resultBox.innerHTML = `<div style="color:#8b949e;">⏳ 等待机器人取走消息 (队列位置: ${data.queue_position}/${data.queue_size})</div>`;
+            }
+        } catch (e) {
+            // ignore
+        }
+    }, 2000);
 }

@@ -1,10 +1,12 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <script src="/js/device-id.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>STC - 用户注册</title>
     <script src="js/config.js"></script>
+    <script src="js/bj-time.js?v=16"></script>
     <style>
         * {
             margin: 0;
@@ -15,30 +17,26 @@
         body {
             font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
             min-height: 100vh;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            /* 背景改由 .page-bg 图层提供（见下方），此处只留兜底底色 */
+            background: #05060a;
             display: flex;
-            justify-content: center;
+            /* 靠右对齐：背景图的「無畏進歩」logo 居中，靠右能让左侧露出文字 */
+            justify-content: flex-end;
             align-items: center;
             padding: 20px;
+            padding-right: clamp(28px, 5vw, 80px);
             position: relative;
             overflow: hidden;
         }
 
+        /* 背景图之上：不再叠加紫/蓝柔光（用户要求不要紫色灯光），改成无色的极淡暗角 */
         body::before {
             content: '';
-            position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle at 30% 30%, rgba(102, 126, 234, 0.3) 0%, transparent 50%),
-                        radial-gradient(circle at 70% 70%, rgba(118, 75, 162, 0.3) 0%, transparent 50%);
-            animation: bgMove 20s linear infinite;
-        }
-
-        @keyframes bgMove {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+            position: fixed;
+            inset: 0;
+            z-index: 1;
+            pointer-events: none;
+            background: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, 0.20) 100%);
         }
 
         .register-container {
@@ -242,6 +240,40 @@
             display: block;
         }
 
+        /* 人机验证码 */
+        .captcha-row {
+            display: flex;
+            gap: 10px;
+            align-items: stretch;
+        }
+
+        .captcha-row .form-input {
+            flex: 1;
+        }
+
+        .captcha-img {
+            width: 120px;
+            height: 50px;
+            border-radius: 12px;
+            cursor: pointer;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 0.05);
+            flex-shrink: 0;
+            object-fit: cover;
+            transition: all 0.3s;
+        }
+
+        .captcha-img:hover {
+            border-color: #667eea;
+            box-shadow: 0 0 15px rgba(102, 126, 234, 0.3);
+        }
+
+        .captcha-hint {
+            margin-top: 6px;
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.4);
+        }
+
         .login-link {
             text-align: center;
             margin-top: 24px;
@@ -292,26 +324,74 @@
             color: #667eea;
         }
 
+        @media (max-width: 640px) {
+            body {
+                justify-content: center;
+                padding-right: 20px;
+            }
+        }
+
         @media (max-width: 480px) {
             .glass-card {
                 padding: 28px 20px;
             }
-            
+
             .title {
                 font-size: 22px;
             }
-            
+
             .invite-code-wrapper {
                 flex-direction: column;
             }
-            
+
             .invite-code-wrapper .send-btn {
                 width: 100%;
             }
         }
+
+        /* ===== 背景图 + 毛玻璃 ===== */
+        .page-bg {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            background: #05060a url('/bg-hero.jpg') center center / cover no-repeat;
+        }
+
+        .page-bg::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(180deg, rgba(5, 6, 10, 0.25) 0%, rgba(5, 6, 10, 0.6) 100%);
+        }
+
+        /* 主卡片：毛玻璃（覆盖上面的基础样式） */
+        .glass-card {
+            background: rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(24px) saturate(160%);
+            -webkit-backdrop-filter: blur(24px) saturate(160%);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.45),
+                        inset 0 1px 1px rgba(255, 255, 255, 0.12);
+        }
+
+        /* 卡片内的次级模块：半透明玻璃感（不再叠加 backdrop-filter，省 GPU） */
+        .form-input {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+        }
+
+        .form-input:focus {
+            background: rgba(255, 255, 255, 0.11);
+        }
     </style>
 </head>
 <body>
+    <div class="page-bg" aria-hidden="true"></div>
+    <div class="aurora-bg">
+        <div class="aurora-blob aurora-blob-1"></div>
+        <div class="aurora-blob aurora-blob-2"></div>
+    </div>
     <div class="register-container">
         <div class="glass-card">
             <div class="header">
@@ -365,6 +445,15 @@
                 </div>
 
                 <div class="form-group">
+                    <label class="form-label">人机验证</label>
+                    <div class="captcha-row">
+                        <input type="text" class="form-input" id="captcha-input" name="captcha" placeholder="请输入图形中的字符" maxlength="4" autocomplete="off" autocapitalize="off">
+                        <img class="captcha-img" id="captcha-img" src="/api/captcha" alt="验证码" title="点击刷新" onclick="refreshCaptcha()">
+                    </div>
+                    <div class="captcha-hint">看不清？点击图片刷新</div>
+                </div>
+
+                <div class="form-group">
                     <label class="form-label">邀请码</label>
                     <input type="text" class="form-input" id="invite-code" name="invite-code" placeholder="请输入邀请码（选填）">
                     <div class="no-invite-link">
@@ -386,6 +475,32 @@
     </div>
 
     <script>
+        let _csrfToken = null;
+
+        // 获取一次性 CSRF Token
+        async function getCsrfToken() {
+            try {
+                const resp = await fetch('/api/csrf-token', { credentials: 'include' });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    _csrfToken = data.csrfToken;
+                    return data.csrfToken;
+                }
+            } catch (e) {}
+            return null;
+        }
+
+        // 生成请求 nonce
+        function genNonce() {
+            return Date.now().toString(36) + Math.random().toString(16).slice(2, 10);
+        }
+
+        // 刷新人机验证码
+        function refreshCaptcha() {
+            const img = document.getElementById('captcha-img');
+            img.src = '/api/captcha?t=' + Date.now();
+        }
+
         // 检查URL参数
         const urlParams = new URLSearchParams(window.location.search);
         const error = urlParams.get('error');
@@ -410,6 +525,7 @@
         let codeTimer = null;
         function sendEmailCode() {
             const email = document.getElementById('email').value.trim();
+            const captcha = document.getElementById('captcha-input').value.trim();
             const btn = document.getElementById('send-code-btn');
             
             if (!email) {
@@ -422,19 +538,37 @@
                 return;
             }
             
+            if (!captcha) {
+                showError('请先输入人机验证码');
+                return;
+            }
+            
             btn.disabled = true;
             btn.textContent = '发送中...';
             
-            fetch('/api/send-verification', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ email })
+            getCsrfToken().then(csrf => {
+                const nonce = genNonce();
+                return fetch('/api/send-code', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+                        'X-Request-Nonce': nonce
+                    },
+                    body: JSON.stringify({ email: email, type: 'register', captcha })
+                });
             })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
+            .then(response => {
+                const ct = response.headers.get('content-type') || '';
+                if (!ct.includes('application/json')) {
+                    return response.text().then(text => {
+                        throw new Error('服务器返回非JSON (HTTP ' + response.status + '): ' + text.substring(0, 200));
+                    });
+                }
+                return response.json().then(data => ({ data, status: response.status }));
+            })
+            .then(({ data, status }) => {
+                if (status === 200 && data.success) {
                     showSuccess('验证码已发送到您的邮箱');
                     let countdown = 60;
                     btn.textContent = countdown + 's';
@@ -452,10 +586,12 @@
                     showError(data.message || '发送验证码失败');
                     btn.disabled = false;
                     btn.textContent = '发送验证码';
+                    refreshCaptcha();
+                    document.getElementById('captcha-input').value = '';
                 }
             })
             .catch(error => {
-                showError('网络错误，请重试');
+                showError('发送失败: ' + error.message);
                 btn.disabled = false;
                 btn.textContent = '发送验证码';
             });
@@ -471,11 +607,17 @@
             const confirmPassword = document.getElementById('confirm-password').value;
             const emailCode = document.getElementById('email-code').value.trim();
             const inviteCode = document.getElementById('invite-code').value.trim();
+            const captcha = document.getElementById('captcha-input').value.trim();
             const btn = document.getElementById('register-btn');
             
             // 验证
             if (!username || !email || !password || !confirmPassword || !emailCode) {
                 showError('请填写所有必填项');
+                return;
+            }
+
+            if (!captcha) {
+                showError('请先输入人机验证码');
                 return;
             }
             
@@ -503,12 +645,16 @@
             btn.textContent = '注册中...';
             
             try {
+                const csrf = await getCsrfToken();
+                const nonce = genNonce();
                 const response = await fetch('/api/register', {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+                        'X-Request-Nonce': nonce
                     },
-                    body: JSON.stringify({ username, email, password, emailCode, inviteCode })
+                    body: JSON.stringify({ username, email, password, verify_code: emailCode, invite_code: inviteCode, captcha })
                 });
                 
                 const data = await response.json();
@@ -519,6 +665,9 @@
                         window.location.href = '/login?message=' + encodeURIComponent('注册成功，请登录');
                     }, 1000);
                 } else {
+                    // 验证码为单次使用，注册失败后刷新验证码
+                    refreshCaptcha();
+                    document.getElementById('captcha-input').value = '';
                     showError(data.message || '注册失败');
                     btn.disabled = false;
                     btn.textContent = '注 册';
@@ -546,5 +695,8 @@
     
     <!-- 版权水印 -->
     <div class="copyright-watermark">© 2025-2026 STC 版权所有</div>
+    <script src="js/animations.js"></script>
+    <!-- 注册页背景音乐（自动循环播放，左下角可静音） -->
+    <script src="js/login-bgm.js?v=2"></script>
 </body>
 </html>

@@ -1,10 +1,13 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <script src="js/config.js"></script>
+    <script src="/js/device-id.js"></script>
+    <script src="js/bj-time.js?v=16"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>STC邮箱</title>
-    <link rel="stylesheet" href="/css/style.css">
+    <link rel="stylesheet" href="/css/style-v5.css?v=19">
     <style>
         * {
             margin: 0;
@@ -14,7 +17,8 @@
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #f0f3f4;
+            /* 背景改由 .page-bg 图层提供（见下方），此处只留兜底底色 */
+            background: #05060a;
             min-height: 100vh;
             overflow: hidden;
         }
@@ -862,9 +866,89 @@
             border-radius: 2px;
             transition: width 0.3s;
         }
+        /* 移动端适配：三栏改为纵向堆叠 */
+        @media (max-width: 768px) {
+            .email-container {
+                flex-direction: column;
+                height: auto;
+                min-height: calc(100vh - 50px);
+            }
+            .sidebar {
+                width: 100%;
+                max-height: 170px;
+                overflow-y: auto;
+                flex-shrink: 0;
+            }
+            .main-content {
+                width: 100%;
+                min-height: 55vh;
+            }
+            .email-detail-container {
+                width: 100%;
+            }
+            .toolbar {
+                flex-wrap: wrap;
+                gap: 6px;
+                padding: 8px 10px;
+            }
+            .email-item {
+                padding: 10px 12px;
+            }
+        }
+
+        /* ===== 背景图 + 毛玻璃 ===== */
+        body.bg-image .navbar {
+            background: rgba(64, 128, 255, 0.72);
+            backdrop-filter: saturate(180%) blur(18px);
+            -webkit-backdrop-filter: saturate(180%) blur(18px);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+        }
+        body.bg-image .sidebar {
+            background: rgba(43, 102, 196, 0.6);
+            backdrop-filter: saturate(180%) blur(18px);
+            -webkit-backdrop-filter: saturate(180%) blur(18px);
+        }
+        body.bg-image .main-content,
+        body.bg-image .email-detail-container {
+            background: rgba(255, 255, 255, 0.88);
+            border-right-color: rgba(255, 255, 255, 0.25);
+            backdrop-filter: blur(18px) saturate(160%);
+            -webkit-backdrop-filter: blur(18px) saturate(160%);
+        }
+        body.bg-image .toolbar,
+        body.bg-image .detail-header {
+            background: rgba(248, 248, 248, 0.75);
+        }
+        body.bg-image .email-item {
+            background: transparent;
+        }
+        body.bg-image .email-item.unread {
+            background: rgba(64, 128, 255, 0.07);
+        }
+        body.bg-image .email-item:hover {
+            background: rgba(64, 128, 255, 0.12);
+        }
+        body.bg-image .compose-window,
+        body.bg-image .modal-content {
+            background: rgba(255, 255, 255, 0.95);
+        }
+        @media (max-width: 768px) {
+            body.bg-image .main-content,
+            body.bg-image .email-detail-container,
+            body.bg-image .navbar,
+            body.bg-image .sidebar {
+                backdrop-filter: blur(10px);
+                -webkit-backdrop-filter: blur(10px);
+            }
+        }
     </style>
 </head>
-<body>
+<body class="bg-image">
+    <div class="page-bg" aria-hidden="true"></div>
+    <div class="aurora-bg">
+        <div class="aurora-blob aurora-blob-1"></div>
+        <div class="aurora-blob aurora-blob-2"></div>
+    </div>
     <nav class="navbar">
         <div class="nav-left">
             <div class="nav-logo">📧 STC邮箱</div>
@@ -1021,12 +1105,45 @@
         let attachedFiles = [];
         let selectedEmails = new Set();
 
+        // 获取一次性 CSRF token（服务端校验后即失效，需每次写请求重新获取）
+        async function getCsrfToken() {
+            try {
+                const resp = await fetch('/api/csrf-token', { credentials: 'include' });
+                if (!resp.ok) return null;
+                const data = await resp.json();
+                return data.csrfToken || null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function genNonce() {
+            try {
+                const arr = new Uint8Array(16);
+                (window.crypto || window.msCrypto).getRandomValues(arr);
+                return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+            } catch (e) {
+                return Date.now().toString(36) + Math.random().toString(16).slice(2, 10);
+            }
+        }
+
         async function fetchWithAuth(url, options = {}) {
-            const response = await fetch(url, {
-                ...options,
-                credentials: 'include'
-            });
-            return response;
+            const method = (options.method || 'GET').toUpperCase();
+            const opts = Object.assign({}, options);
+            opts.credentials = 'include';
+            opts.headers = Object.assign({}, options.headers || {});
+
+            // 登录态已改为服务端 httpOnly cookie（opts.credentials='include' 自动携带），前端不再持有 token
+            try { localStorage.removeItem('stc_auth_token'); } catch (e) {}
+
+            // 写请求必须携带 CSRF token 与一次性 nonce，否则服务端直接 403
+            if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+                const csrf = await getCsrfToken();
+                if (csrf) opts.headers['X-CSRF-Token'] = csrf;
+                opts.headers['X-Request-Nonce'] = genNonce();
+            }
+
+            return await fetch(url, opts);
         }
 
         async function loadStats() {
@@ -1510,13 +1627,29 @@
             console.log('Toggle star:', emailId);
         }
 
+        // 时间显示统一按北京时间（见 js/bj-time.js）
         function formatTime(timestamp) {
+            if (window.STCBeijing) {
+                const nowAbs = STCBeijing.absMs();
+                const p = STCBeijing.partsAbs(STCBeijing.toMs(timestamp));
+                const today = STCBeijing.partsAbs(nowAbs);
+                const dayMs = 24 * 60 * 60 * 1000;
+                const diff = Math.max(0, nowAbs - STCBeijing.toMs(timestamp));
+
+                if (p.date === today.date) {
+                    return String(p.hour).padStart(2, '0') + ':' + String(p.minute).padStart(2, '0');
+                }
+                if (p.date === STCBeijing.partsAbs(nowAbs - dayMs).date) return '昨天';
+                if (diff < 7 * dayMs) return Math.floor(diff / dayMs) + '天前';
+                return p.month + '月' + p.day + '日';
+            }
+
             const date = new Date(timestamp);
             const now = new Date();
-            
+
             const diff = now - date;
             const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-            
+
             if (days === 0) {
                 return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
             } else if (days === 1) {
@@ -1529,6 +1662,8 @@
         }
 
         function formatFullTime(timestamp) {
+            if (window.STCBeijing) return STCBeijing.fullDateTime(timestamp);
+
             const date = new Date(timestamp);
             return date.toLocaleString('zh-CN', {
                 year: 'numeric',
@@ -1605,5 +1740,6 @@
     
     <!-- 版权水印 -->
     <div class="copyright-watermark">© 2025-2026 STC 版权所有</div>
+    <script src="js/animations.js"></script>
 </body>
 </html>

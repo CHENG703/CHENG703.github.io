@@ -241,17 +241,32 @@ async function fetchWithAuth(url, options = {}) {
     // 确保发送cookies以维持session
     options.credentials = 'include';
     
-    // 对于POST、PUT、DELETE请求，添加CSRF token
-    if (options.method && ['POST', 'PUT', 'DELETE'].includes(options.method.toUpperCase())) {
-        if (!csrfToken) {
-            csrfToken = await getCSRFToken();
+    // 登录态已改为服务端 httpOnly cookie（fetch 自动携带），前端不再持有 token；
+    // 顺手清掉旧版本留在 localStorage 里的 token，避免被 XSS 捡走
+    try { localStorage.removeItem('stc_auth_token'); } catch (e) {}
+    
+    // 对于写请求（POST、PUT、DELETE、PATCH）：
+    // 1. 每次都获取新的一次性 CSRF token（防重放，服务器端单次使用后删除）
+    // 2. 生成唯一 nonce（防抓包重放）
+    const method = (options.method || 'GET').toUpperCase();
+    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+        // 每次写请求都拿新 token（CSRF token 是一次性的）
+        try {
+            const newToken = await getCSRFToken();
+            csrfToken = newToken;
+        } catch (e) {
+            console.warn('[CSRF] 刷新token失败:', e);
         }
-        
         if (csrfToken) {
-            // 添加CSRF token到header
             options.headers = options.headers || {};
             options.headers['X-CSRF-Token'] = csrfToken;
         }
+        // 生成请求 nonce：时间戳(ms) + 8位随机十六进制
+        const nonce = Date.now().toString(36) + Math.random().toString(16).slice(2, 10);
+        options.headers = options.headers || {};
+        options.headers['X-Request-Nonce'] = nonce;
+        // 用过后清空本地缓存 token，强制下次请求再取
+        csrfToken = null;
     }
     
     const response = await fetch(url, options);
@@ -269,22 +284,16 @@ async function fetchWithAuth(url, options = {}) {
         }
     }
     
+    if (response.status === 401) {
+        console.log('[AUTH] 收到 401 未授权响应');
+        throw new Error('Unauthorized');
+    }
+    
     if (response.status === 403) {
         const error = await response.json();
         const errorMsg = error.error || '';
-        // 只有当提示"请先登录"时才跳转登录页
-        if (errorMsg.includes('请先登录') || errorMsg.includes('未登录')) {
-            showMessage('登录已过期，请重新登录', 'error');
-            localStorage.removeItem('user');
-            setTimeout(() => {
-                window.location.href = '/login';
-            }, 2000);
-            throw new Error('AccessDenied');
-        } else {
-            // 其他权限错误（如无权删除）仅显示消息，不跳转
-            showMessage(errorMsg || '权限不足', 'error');
-            throw new Error('PermissionDenied');
-        }
+        // 不强制跳转，让调用者决定如何处理
+        throw new Error('PermissionDenied');
     }
     
     return response;
@@ -357,22 +366,12 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// 格式化日期函数
+// 格式化日期函数（统一按北京时间，见 js/bj-time.js）
 function formatDate(dateString) {
     if (!dateString) return '';
+    if (window.STCBeijing) return STCBeijing.relative(dateString);
+
     const date = new Date(dateString);
-    const now = new Date();
-    const diff = now - date;
-    
-    const minute = 60 * 1000;
-    const hour = 60 * minute;
-    const day = 24 * hour;
-    
-    if (diff < minute) return '刚刚';
-    if (diff < hour) return Math.floor(diff / minute) + '分钟前';
-    if (diff < day) return Math.floor(diff / hour) + '小时前';
-    if (diff < 7 * day) return Math.floor(diff / day) + '天前';
-    
     return date.toLocaleDateString('zh-CN');
 }
 
@@ -410,9 +409,8 @@ async function checkLoginStatus() {
             return currentUser;
         }
     } catch (error) {
-        if (error.message !== 'AccessDenied') {
-            console.error('检查登录状态失败:', error);
-        }
+        // checkLoginStatus 不应该强制跳转，只是返回 null
+        console.log('[AUTH] checkLoginStatus:', error.message);
     }
     return null;
 }
@@ -423,6 +421,7 @@ async function logout() {
         const response = await fetchWithAuth('/api/logout', {
             method: 'POST'
         });
+        // 登录态 cookie 由服务端在 /api/logout 里清除
         if (response.ok) {
             showMessage('登出成功');
             setTimeout(() => {
@@ -432,8 +431,15 @@ async function logout() {
             showMessage('登出失败', 'error');
         }
     } catch (error) {
-        if (error.message !== 'AccessDenied') {
+        // 即使请求失败，也不再保留任何本地登录态
+        if (error.message !== 'AccessDenied' && error.message !== 'Unauthorized') {
             showMessage('登出失败', 'error');
+        } else {
+            // 401/403 也视为登出成功（token 已失效）
+            showMessage('登出成功');
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 1000);
         }
     }
 }
@@ -466,8 +472,14 @@ function getStatusColor(status) {
 
 // 加载任务列表
 async function loadTasks() {
+    // 仅当页面中存在任务列表容器时才加载（其它页面无此元素，避免空引用报错）
+    const listContainer = document.getElementById('tasks-list');
+    if (!listContainer) return;
+
     try {
-        const response = await fetch('/api/tasks');
+        // 加时间戳 + no-store：避免浏览器/CDN 复用旧的任务列表缓存，
+        // 否则"删除任务成功 → 刷新又出现"其实是读到了缓存的旧响应。
+        const response = await fetch('/api/tasks?_t=' + Date.now(), { cache: 'no-store' });
         if (response.ok) {
             const result = await response.json();
             const tasks = result.data || [];
@@ -504,9 +516,9 @@ async function loadTasks() {
                 const canModifyStatus = currentUser && (currentUser.id === task.author_id || isAdmin);
                 
                 return `
-                <div class="task-card ${task.pinned ? 'pinned' : ''}" onclick="viewTask(${task.id})">
+                <div class="task-card ${task.is_pinned ? 'pinned' : ''}" onclick="viewTask(${task.id})">
                     <div class="task-content">
-                        <h3 class="task-title">${escapeHtml(task.title)}</h3>
+                        <h3 class="task-title">${task.is_pinned ? '<span class="pinned-label">📌 置顶</span>' : ''}${escapeHtml(task.title)}</h3>
                         <div class="task-meta">
                             <span>👤 ${escapeHtml(task.user ? task.user.username : '匿名')}</span>
                             <span>📅 ${formatDate(task.created_at)}</span>
@@ -534,11 +546,14 @@ async function loadTasks() {
                     ${(isAdmin || (currentUser && currentUser.id === task.author_id)) ? `<button class="btn-delete-task" onclick="event.stopPropagation(); deleteTask(${task.id})" title="删除任务">🗑️</button>` : ''}
                 </div>
             `}).join('');
+            
+            // 任务加载后初始化滚动动画
+            if (window.reinitScrollAnimations) window.reinitScrollAnimations();
         }
     } catch (error) {
         if (error.message !== 'AccessDenied') {
             console.error('加载任务失败:', error);
-            document.getElementById('tasks-list').innerHTML = '<p style="text-align: center; color: var(--error-color);">加载失败</p>';
+            if (listContainer) listContainer.innerHTML = '<p style="text-align: center; color: var(--error-color);">加载失败</p>';
         }
     }
 }
@@ -585,8 +600,12 @@ async function downloadFile(taskId) {
             document.body.removeChild(a);
             showMessage('文件下载成功');
         } else {
-            const error = await response.json();
-            showMessage(error.error || '文件下载失败', 'error');
+            let msg = '文件下载失败';
+            try {
+                const error = await response.json();
+                msg = error.message || error.error || msg;
+            } catch (e) { /* 非 JSON 响应 */ }
+            showMessage(msg, 'error');
         }
     } catch (error) {
         showMessage('文件下载失败，请重试', 'error');
@@ -629,12 +648,24 @@ async function deleteTask(taskId) {
             showMessage('任务删除成功');
             loadTasks();
         } else {
-            const error = await response.json();
-            showMessage(error.error || '删除失败', 'error');
+            // 展示服务端的具体原因（如"数据未保存"），避免只看到笼统的"删除失败"
+            let msg = '删除失败';
+            try {
+                const err = await response.json();
+                msg = err.message || err.error || msg;
+            } catch (e) { /* 响应非 JSON */ }
+            showMessage(msg, 'error');
+            // 删除失败时也刷新一次，避免界面与服务器状态不一致
+            loadTasks();
         }
     } catch (error) {
-        if (error.message !== 'AccessDenied') {
-            showMessage('删除失败，请重试', 'error');
+        // fetchWithAuth 对 401/403 直接抛错（不返回 response），这里要给出可诊断的提示
+        if (error.message === 'Unauthorized') {
+            showMessage('登录已过期，请重新登录后再删除', 'error');
+        } else if (error.message === 'PermissionDenied') {
+            showMessage('删除失败：权限不足（仅管理员可删除任务）或登录状态已失效', 'error');
+        } else if (error.message !== 'AccessDenied') {
+            showMessage('删除失败：' + (error.message || '请重试'), 'error');
         }
     }
 }
@@ -656,7 +687,7 @@ async function publishTask() {
     };
     
     try {
-        const userResp = await fetch('/api/user', { credentials: 'include' });
+        const userResp = await fetchWithAuth('/api/user');
         if (!userResp.ok) {
             restoreBtn();
             showConfirmModal('发布任务需要先登录，是否前往登录页？', () => {
@@ -718,9 +749,15 @@ async function publishTask() {
                         </select>
                     </div>
                     <div style="margin-bottom:15px;">
-                        <label style="display:block;color:#8b949e;font-size:12px;margin-bottom:6px;">附件（可选，最大 2GB，支持所有类型）</label>
+                        <label style="display:block;color:#8b949e;font-size:12px;margin-bottom:6px;">附件（可选，支持所有类型；云端环境单次上传上限约 4MB）</label>
                         <input type="file" id="task-file" style="width:100%;padding:8px;background:#161b22;border:1px dashed #30363d;border-radius:6px;color:#f0f6fc;box-sizing:border-box;font-size:12px;" onchange="window._taskFile=this.files[0];window._taskFileSizeText=this.files[0]?'已选 '+this.files[0].name+' ('+formatSize(this.files[0].size)+')':'';">
                         <div id="task-file-info" style="color:#8b949e;font-size:11px;margin-top:4px;"></div>
+                    </div>
+                    <div style="margin-bottom:15px;">
+                        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:#f0f6fc;font-size:14px;padding:10px;background:#161b22;border:1px solid #30363d;border-radius:6px;">
+                            <input type="checkbox" id="task-pinned" style="width:16px;height:16px;cursor:pointer;accent-color:#fbbf24;">
+                            <span>📌 置顶任务</span>
+                        </label>
                     </div>
                     <div style="display:flex;gap:10px;">
                         <button onclick="closePublishModal()" style="flex:1;padding:10px;background:#21262d;color:#f0f6fc;border:1px solid #30363d;border-radius:6px;cursor:pointer;">取消</button>
@@ -751,6 +788,7 @@ async function publishTask() {
             const reward = document.getElementById('task-reward').value;
             const deadline = document.getElementById('task-deadline').value;
             const status = document.getElementById('task-status').value;
+            const isPinned = document.getElementById('task-pinned').checked;
             const fileInput = document.getElementById('task-file');
             const file = fileInput && fileInput.files[0];
             
@@ -777,6 +815,7 @@ async function publishTask() {
                 if (reward) formData.append('reward', reward);
                 if (deadline) formData.append('deadline', deadline);
                 if (status) formData.append('status', status);
+                formData.append('isPinned', isPinned);
                 if (file) formData.append('file', file);
                 
                 if (!csrfToken) {
@@ -786,19 +825,20 @@ async function publishTask() {
                         csrfToken = tkData.csrfToken;
                     }
                 }
-                
-                const headers = {};
-                if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
-                
-                const response = await fetch('/api/tasks', {
+
+                // 使用 fetchWithAuth 确保 Vercel 环境下带上 Authorization 头
+                const response = await fetchWithAuth('/api/tasks', {
                     method: 'POST',
-                    credentials: 'include',
-                    headers: headers,
                     body: formData
                 });
                 
                 if (response.ok) {
-                    showMessage('任务发布成功');
+                    let okMsg = '任务发布成功';
+                    try {
+                        const data = await response.json();
+                        if (data && data.message) okMsg = data.message;
+                    } catch (e) { /* 忽略 */ }
+                    showMessage(okMsg);
                     closePublishModal();
                     loadTasks();
                 } else {
@@ -827,7 +867,15 @@ async function publishTask() {
         
     } catch (error) {
         restoreBtn();
-        showMessage('发布功能暂时不可用', 'error');
+        // 401 未授权 / 未登录，引导用户登录
+        if (error.message === 'Unauthorized' || error.message === 'AccessDenied') {
+            showConfirmModal('登录状态已失效，是否前往登录页？', () => {
+                window.location.href = '/login';
+            });
+        } else if (error.message !== 'PermissionDenied' && error.message !== 'SiteLocked') {
+            console.error('[publishTask] 错误:', error);
+            showMessage('发布功能暂时不可用：' + (error.message || '请重试'), 'error');
+        }
     }
 }
 
@@ -869,6 +917,10 @@ function showConfirmModal(message, onConfirm, onCancel) {
 
 // 加载留言列表
 async function loadMessages() {
+    // 仅当页面中存在留言列表容器时才加载（其它页面无此元素，避免空引用报错）
+    const listContainer = document.getElementById('messages-list');
+    if (!listContainer) return;
+
     try {
         const response = await fetch('/api/public/messages');
         if (response.ok) {
@@ -890,11 +942,14 @@ async function loadMessages() {
                     <div class="message-content">${escapeHtml(message.content)}</div>
                 </div>
             `).join('');
+            
+            // 留言加载后初始化滚动动画
+            if (window.reinitScrollAnimations) window.reinitScrollAnimations();
         }
     } catch (error) {
         if (error.message !== 'AccessDenied') {
             console.error('加载留言失败:', error);
-            document.getElementById('messages-list').innerHTML = '<p style="text-align: center; color: var(--error-color);">加载失败</p>';
+            if (listContainer) listContainer.innerHTML = '<p style="text-align: center; color: var(--error-color);">加载失败</p>';
         }
     }
 }
@@ -962,30 +1017,217 @@ async function deleteMessage(messageId) {
     }
 }
 
-function calculateUnionDays() {
-    const unionStartDate = new Date('2025-01-24');
-    const now = new Date();
-    const diffTime = Math.abs(now - unionStartDate);
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-    const element = document.getElementById('union-days');
-    if (element) {
-        element.textContent = diffDays;
+// ==================== 公告系统 ====================
+const ANNOUNCEMENT_PAGE_MAX = 5; // 主页列表最多展示条数
+
+// 主页公告区块：渲染最近公告（公开，无需登录）
+async function loadAnnouncements() {
+    const container = document.getElementById('announcements-list');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/announcements', { credentials: 'include' });
+        if (!response.ok) throw new Error('bad status');
+        const result = await response.json();
+        const list = (result.data || []).slice(0, ANNOUNCEMENT_PAGE_MAX);
+        if (list.length === 0) {
+            container.innerHTML = '<p style="text-align:center;color:var(--text-secondary,#94a3b8);margin:8px 0;">暂无公告</p>';
+            return;
+        }
+        container.innerHTML = list.map(a => `
+            <div class="announcement-card">
+                <div class="announcement-head">
+                    <span class="announcement-title">${escapeHtml(a.title)}</span>
+                    <span class="announcement-meta">${escapeHtml(a.created_by || '管理员')} · ${formatDate(a.created_at)}</span>
+                </div>
+                <div class="announcement-content">${escapeHtml(a.content)}</div>
+            </div>
+        `).join('');
+        if (window.reinitScrollAnimations) window.reinitScrollAnimations();
+    } catch (error) {
+        if (error.message !== 'AccessDenied') {
+            console.error('加载公告失败:', error);
+            container.innerHTML = '<p style="text-align:center;color:var(--text-secondary,#94a3b8);margin:8px 0;">公告加载失败</p>';
+        }
+    }
+}
+
+// 登录后检查未读公告，有则弹窗提醒一次
+async function checkUnreadAnnouncements() {
+    try {
+        const response = await fetchWithAuth('/api/announcements/unread');
+        if (!response.ok) return;
+        const result = await response.json();
+        const unread = result.data || [];
+        if (unread.length === 0) return;
+        // 稍作延迟，避免打断首屏体验
+        setTimeout(() => showAnnouncementModal(unread), 600);
+    } catch (e) {
+        if (e.message !== 'AccessDenied' && e.message !== 'PermissionDenied' && e.message !== 'SiteLocked') {
+            console.warn('获取未读公告失败:', e.message);
+        }
+    }
+}
+
+// 公告弹窗：列出未读公告，点"我知道了"批量标已读
+function showAnnouncementModal(unreadList) {
+    if (document.getElementById('announcement-modal')) return;
+    const ids = unreadList.map(a => a.id);
+
+    const modal = document.createElement('div');
+    modal.id = 'announcement-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:999999;display:flex;align-items:center;justify-content:center;';
+
+    const dialog = document.createElement('div');
+    dialog.style.cssText = 'background:var(--card-bg,#0d1117);padding:24px;border-radius:16px;max-width:520px;width:92%;max-height:80vh;overflow-y:auto;border:1px solid #30363d;box-sizing:border-box;';
+    dialog.innerHTML =
+        '<div style="font-size:18px;font-weight:700;margin-bottom:4px;">📢 平台公告</div>' +
+        (unreadList.length > 1
+            ? '<div style="color:#8b949e;font-size:12px;margin-bottom:12px;">共有 ' + unreadList.length + ' 条新公告</div>'
+            : '<div style="height:12px;"></div>');
+
+    unreadList.forEach(a => {
+        const item = document.createElement('div');
+        item.style.cssText = 'border:1px solid #30363d;border-radius:10px;padding:12px;margin-bottom:12px;';
+        item.innerHTML =
+            '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px;">' +
+                '<strong style="color:var(--text-primary,#f0f6fc);font-size:15px;">' + escapeHtml(a.title) + '</strong>' +
+                '<span style="color:#8b949e;font-size:11px;white-space:nowrap;">' + escapeHtml(a.created_by || '管理员') + ' · ' + formatDate(a.created_at) + '</span>' +
+            '</div>' +
+            '<div style="color:var(--text-secondary,#9da7b3);font-size:14px;line-height:1.7;white-space:pre-wrap;word-break:break-word;">' + escapeHtml(a.content) + '</div>';
+        dialog.appendChild(item);
+    });
+
+    const btn = document.createElement('button');
+    btn.textContent = '我知道了';
+    btn.style.cssText = 'width:100%;padding:11px;background:var(--accent-color,#4a9eff);color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600;';
+    btn.onclick = () => {
+        modal.remove();
+        markAnnouncementsRead(ids);
+    };
+    dialog.appendChild(btn);
+    modal.appendChild(dialog);
+    document.body.appendChild(modal);
+}
+
+// 标记公告已读（静默失败，下次访问仍会提醒）
+async function markAnnouncementsRead(ids) {
+    try {
+        await fetchWithAuth('/api/announcements/read', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids })
+        });
+    } catch (e) {
+        if (e.message !== 'AccessDenied' && e.message !== 'PermissionDenied' && e.message !== 'SiteLocked') {
+            console.warn('标记公告已读失败:', e.message);
+        }
+    }
+}
+
+// 首页名人名言（API 不可用时的内置兜底，均标注出处）
+const FALLBACK_QUOTES = [
+    { text: '千里之行，始于足下。', source: '老子《道德经》' },
+    { text: '学而不思则罔，思而不学则殆。', source: '《论语·为政》' },
+    { text: '长风破浪会有时，直挂云帆济沧海。', source: '李白《行路难》' },
+    { text: '不积跬步，无以至千里；不积小流，无以成江海。', source: '荀子《劝学》' },
+    { text: '天行健，君子以自强不息。', source: '《周易》' },
+    { text: '宝剑锋从磨砺出，梅花香自苦寒来。', source: '《警世贤文》' },
+    { text: '志当存高远。', source: '诸葛亮《诫外生书》' },
+    { text: '业精于勤，荒于嬉；行成于思，毁于随。', source: '韩愈《进学解》' },
+    { text: '路漫漫其修远兮，吾将上下而求索。', source: '屈原《离骚》' },
+    { text: '不畏浮云遮望眼，自缘身在最高层。', source: '王安石《登飞来峰》' }
+];
+
+async function loadQuote() {
+    const textEl = document.getElementById('quote-text');
+    const sourceEl = document.getElementById('quote-source');
+    if (!textEl || !sourceEl) return;
+
+    // 打字机逐字显示名言，完成后淡入出处
+    const typeQuote = (text, source) => {
+        textEl.textContent = '';
+        sourceEl.textContent = '';
+        sourceEl.classList.remove('show');
+        textEl.classList.add('typing');
+        let index = 0;
+        const speed = 110; // 每字间隔（毫秒）
+        let typingTimer;
+        const tick = () => {
+            index++;
+            textEl.textContent = text.slice(0, index);
+            if (index >= text.length) {
+                clearInterval(typingTimer);
+                textEl.classList.remove('typing');
+                setTimeout(() => {
+                    sourceEl.textContent = source;
+                    sourceEl.classList.add('show');
+                }, 250);
+            }
+        };
+        typingTimer = setInterval(tick, speed);
+        setTimeout(tick, 60); // 稍作停顿后打出第一个字
+    };
+
+    // 优先从一言(Hitokoto) API 获取：https://github.com/hitokoto-osc/hitokoto
+    try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 6000);
+        const response = await fetch('https://v1.hitokoto.cn/?c=k&c=i&c=a&c=j', { signal: controller.signal });
+        clearTimeout(timer);
+        if (!response.ok) throw new Error('bad status');
+        const data = await response.json();
+        if (!data.hitokoto) throw new Error('empty quote');
+        const fromWho = data.from_who || '';
+        const from = data.from || '';
+        let source = from ? '《' + from + '》' : '';
+        if (fromWho) source = fromWho + source;
+        typeQuote(data.hitokoto, source);
+    } catch (e) {
+        // API 不可用时使用内置名言
+        const fallback = FALLBACK_QUOTES[Math.floor(Math.random() * FALLBACK_QUOTES.length)];
+        typeQuote(fallback.text, fallback.source);
     }
 }
 
 // 页面加载完成后执行
 document.addEventListener('DOMContentLoaded', async () => {
+    // 清理历史遗留的 CookieStore 分片 cookie（避免 494 REQUEST_HEADER_TOO_LARGE）
+    try {
+        document.cookie.split(';').forEach(c => {
+            const name = c.split('=')[0].trim();
+            if (name.startsWith('sess_')) {
+                document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; secure; samesite=none';
+            }
+        });
+    } catch (e) {}
+
     // 初始化主题
     initTheme();
     
     // 连接网站事件SSE（监听网站锁定）
     connectSiteEvents();
     
-    // 计算工会成立天数
-    calculateUnionDays();
+    // 加载首页名人名言（替换原成立天数显示）
+    loadQuote();
     
     // 检查登录状态
-    const user = await checkLoginStatus();
+    let user = await checkLoginStatus();
+    
+    // 如果未登录，尝试检查 Logto 认证
+    if (!user) {
+        try {
+            const response = await fetch('/api/auth/logto/check', { credentials: 'include' });
+            const data = await response.json();
+            // 服务端已把登录态写进 httpOnly cookie，这里只需确认是否登录成功
+            if (data.authenticated) {
+                console.log('[LOGTO] 通过 Logto 登录成功:', data.username);
+                // 重新检查登录状态
+                user = await checkLoginStatus();
+            }
+        } catch (e) {
+            // Logto 检查失败，静默忽略
+        }
+    }
     
     // 如果已登录，显示留言表单
     if (user) {
@@ -995,7 +1237,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
     
-    // 加载任务和留言
+    // 加载任务、留言与公告
     loadTasks();
     loadMessages();
+    loadAnnouncements();
+
+    // 已登录用户：检查未读公告，有则弹窗提醒一次
+    if (user) {
+        checkUnreadAnnouncements();
+    }
 });

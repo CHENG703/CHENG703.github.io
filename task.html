@@ -1,16 +1,23 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <script src="/js/device-id.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>任务详情 - STC网站</title>
     <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
     <meta name="googlebot" content="noindex, nofollow">
-    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/style-v5.css?v=19">
     <script src="js/lang.js"></script>
     <script src="js/config.js"></script>
+    <script src="js/bj-time.js?v=16"></script>
 </head>
-<body>
+<body class="bg-image">
+    <div class="page-bg" aria-hidden="true"></div>
+    <div class="aurora-bg">
+        <div class="aurora-blob aurora-blob-1"></div>
+        <div class="aurora-blob aurora-blob-2"></div>
+    </div>
     <nav class="navbar">
         <div class="container">
             <div class="nav-brand">
@@ -19,6 +26,7 @@
             <ul class="nav-menu" id="navMenu">
                 <li><a href="/" data-lang="nav.home">首页</a></li>
                 <li><a href="/about" data-lang="nav.about">关于我们</a></li>
+                <li><a href="/products" data-lang="nav.products">产品</a></li>
                 <li><a href="#tasks" data-lang="nav.tasks">任务</a></li>
                 <li><a href="#messages" data-lang="nav.messages">留言</a></li>
                 <li><button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()">🌙</button></li>
@@ -46,15 +54,16 @@
                 <a href="#" onclick="showTerms('service')">使用条款</a> | 
                 <a href="#" onclick="showTerms('privacy')">隐私协议</a>
             </p>
-            <p class="footer-note">一切解释权归STC团队</p>
+            <p class="footer-note">使用本网站即表示您已阅读并同意服务条款与隐私协议</p>
         </div>
     </footer>
 
-    <script src="js/task.js"></script>
+    <script src="js/task.js?v=18"></script>
     <script>
         function showTerms(type) {
             window.open('/terms.html?type=' + type, 'terms', 'width=800,height=600,scrollbars=yes,resizable=yes');
         }
     </script>
+    <script src="js/animations.js"></script>
 </body>
 </html>
